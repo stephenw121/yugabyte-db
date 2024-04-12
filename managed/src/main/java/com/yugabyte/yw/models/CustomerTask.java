@@ -6,36 +6,51 @@ import static io.swagger.annotations.ApiModelProperty.AccessMode.READ_ONLY;
 import static play.mvc.Http.Status.BAD_REQUEST;
 
 import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.google.api.client.util.Strings;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableSet;
 import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.Util;
+import com.yugabyte.yw.common.logging.LogUtil;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import io.ebean.Finder;
 import io.ebean.Model;
 import io.ebean.annotation.EnumValue;
 import io.ebean.annotation.Transactional;
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
 import java.lang.reflect.Field;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
+import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
-import javax.persistence.Column;
-import javax.persistence.Entity;
-import javax.persistence.GeneratedValue;
-import javax.persistence.GenerationType;
-import javax.persistence.Id;
+import lombok.Getter;
+import lombok.Setter;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import play.data.validation.Constraints;
 
 @Entity
 @ApiModel(
     description = "Customer task information. A customer task has a _target_ and a _task type_.")
+@Getter
+@Setter
 public class CustomerTask extends Model {
   public static final Logger LOG = LoggerFactory.getLogger(CustomerTask.class);
 
@@ -58,6 +73,9 @@ public class CustomerTask extends Model {
     @EnumValue("Backup")
     Backup(false),
 
+    @EnumValue("Schedule")
+    Schedule(false),
+
     @EnumValue("Customer Configuration")
     CustomerConfiguration(false),
 
@@ -65,7 +83,19 @@ public class CustomerTask extends Model {
     KMSConfiguration(false),
 
     @EnumValue("XCluster Configuration")
-    XClusterConfig(true);
+    XClusterConfig(true),
+
+    @EnumValue("Disaster Recovery Config")
+    DrConfig(true),
+
+    @EnumValue("Universe Key")
+    UniverseKey(true),
+
+    @EnumValue("Master Key")
+    MasterKey(true),
+
+    @EnumValue("Node Agent")
+    NodeAgent(false);
 
     private final boolean universeTarget;
 
@@ -115,11 +145,20 @@ public class CustomerTask extends Model {
     @EnumValue("Reboot")
     Reboot,
 
+    @EnumValue("Hard Reboot")
+    HardReboot,
+
+    @EnumValue("Replace")
+    Replace,
+
     @EnumValue("Edit")
     Edit,
 
     @EnumValue("Synchronize")
     Sync,
+
+    @EnumValue("LdapSync")
+    LdapSync,
 
     @EnumValue("RestartUniverse")
     RestartUniverse,
@@ -127,11 +166,23 @@ public class CustomerTask extends Model {
     @EnumValue("SoftwareUpgrade")
     SoftwareUpgrade,
 
+    @EnumValue("SoftwareUpgradeYB")
+    SoftwareUpgradeYB,
+
+    @EnumValue("FinalizeUpgrade")
+    FinalizeUpgrade,
+
+    @EnumValue("RollbackUpgrade")
+    RollbackUpgrade,
+
     @EnumValue("GFlagsUpgrade")
     GFlagsUpgrade,
 
     @EnumValue("KubernetesOverridesUpgrade")
     KubernetesOverridesUpgrade,
+
+    @EnumValue("EditKubernetesUniverse")
+    EditKubernetesUniverse,
 
     @EnumValue("CertsRotate")
     CertsRotate,
@@ -163,16 +214,15 @@ public class CustomerTask extends Model {
     @EnumValue("UpdateCert")
     UpdateCert,
 
-    @Deprecated
-    @EnumValue("ToggleTls")
-    ToggleTls,
-
     @EnumValue("UpdateDiskSize")
     UpdateDiskSize,
 
     @Deprecated
     @EnumValue("UpgradeGflags")
     UpgradeGflags,
+
+    @EnumValue("UpdateLoadBalancerConfig")
+    UpdateLoadBalancerConfig,
 
     @EnumValue("BulkImportData")
     BulkImportData,
@@ -187,8 +237,11 @@ public class CustomerTask extends Model {
     @EnumValue("CreatePitrConfig")
     CreatePitrConfig,
 
-    @EnumValue("RestoreSnapshot")
-    RestoreSnapshot,
+    @EnumValue("DeletePitrConfig")
+    DeletePitrConfig,
+
+    @EnumValue("RestoreSnapshotSchedule")
+    RestoreSnapshotSchedule,
 
     @Deprecated
     @EnumValue("SetEncryptionKey")
@@ -218,25 +271,39 @@ public class CustomerTask extends Model {
     @EnumValue("ExternalScript")
     ExternalScript,
 
-    /** @deprecated TargetType name must not be part of TaskType. Use {@link #Create} instead. */
+    /**
+     * @deprecated TargetType name must not be part of TaskType. Use {@link #Create} instead.
+     */
     @Deprecated
     @EnumValue("CreateXClusterConfig")
     CreateXClusterConfig,
 
-    /** @deprecated TargetType name must not be part of TaskType. Use {@link #Edit} instead. */
+    /**
+     * @deprecated TargetType name must not be part of TaskType. Use {@link #Edit} instead.
+     */
     @Deprecated
     @EnumValue("EditXClusterConfig")
     EditXClusterConfig,
 
-    /** @deprecated TargetType name must not be part of TaskType. Use {@link #Delete} instead. */
+    /**
+     * @deprecated TargetType name must not be part of TaskType. Use {@link #Delete} instead.
+     */
     @Deprecated
     @EnumValue("DeleteXClusterConfig")
     DeleteXClusterConfig,
 
-    /** @deprecated TargetType name must not be part of TaskType. Use {@link #Sync} instead. */
+    /**
+     * @deprecated TargetType name must not be part of TaskType. Use {@link #Sync} instead.
+     */
     @Deprecated
     @EnumValue("SyncXClusterConfig")
     SyncXClusterConfig,
+
+    @EnumValue("Failover")
+    Failover,
+
+    @EnumValue("Switchover")
+    Switchover,
 
     @EnumValue("PrecheckNode")
     PrecheckNode,
@@ -253,6 +320,9 @@ public class CustomerTask extends Model {
     @EnumValue("ThirdpartySoftwareUpgrade")
     ThirdpartySoftwareUpgrade,
 
+    @EnumValue("ModifyAuditLoggingConfig")
+    ModifyAuditLoggingConfig,
+
     @EnumValue("RotateAccessKey")
     RotateAccessKey,
 
@@ -265,11 +335,35 @@ public class CustomerTask extends Model {
     @EnumValue("InstallYbcSoftware")
     InstallYbcSoftware,
 
+    @EnumValue("InstallYbcSoftwareOnK8s")
+    InstallYbcSoftwareOnK8s,
+
     @EnumValue("UpgradeUniverseYbc")
     UpgradeUniverseYbc,
 
     @EnumValue("DisableYbc")
-    DisableYbc;
+    DisableYbc,
+
+    @EnumValue("UpgradeYbcGFlags")
+    UpgradeYbcGFlags,
+
+    @EnumValue("ConfigureDBApis")
+    ConfigureDBApis,
+
+    @EnumValue("ConfigureDBApisKubernetes")
+    ConfigureDBApisKubernetes,
+
+    @EnumValue("CreateImageBundle")
+    CreateImageBundle,
+
+    @EnumValue("ReprovisionNode")
+    ReprovisionNode,
+
+    @EnumValue("Install")
+    Install,
+
+    @EnumValue("UpdateProxyConfig")
+    UpdateProxyConfig;
 
     public String toString(boolean completed) {
       switch (this) {
@@ -282,11 +376,14 @@ public class CustomerTask extends Model {
         case Release:
           return completed ? "Released " : "Releasing ";
         case Reboot:
+        case HardReboot:
           return completed ? "Rebooted " : "Rebooting ";
         case Remove:
           return completed ? "Removed " : "Removing ";
         case ResizeNode:
           return completed ? "Resized Node " : "Resizing Node ";
+        case Replace:
+          return completed ? "Replaced Node" : "Replacing Node";
         case Resume:
           return completed ? "Resumed " : "Resuming ";
         case Start:
@@ -301,16 +398,26 @@ public class CustomerTask extends Model {
           return completed ? "Edited " : "Editing ";
         case Sync:
           return completed ? "Synchronized " : "Synchronizing ";
+        case LdapSync:
+          return completed ? "LDAP Sync Completed on " : "LDAP Sync in Progress on ";
         case RestartUniverse:
           return completed ? "Restarted " : "Restarting ";
         case SoftwareUpgrade:
           return completed ? "Upgraded Software " : "Upgrading Software ";
+        case SoftwareUpgradeYB:
+          return completed ? "Upgraded Software " : "Upgrading Software ";
+        case FinalizeUpgrade:
+          return completed ? "Finalized Upgrade " : "Finalizing Upgrade ";
+        case RollbackUpgrade:
+          return completed ? "Rolled back upgrade " : "Rolling back upgrade ";
         case SystemdUpgrade:
           return completed ? "Upgraded to Systemd " : "Upgrading to Systemd ";
         case GFlagsUpgrade:
           return completed ? "Upgraded GFlags " : "Upgrading GFlags ";
         case KubernetesOverridesUpgrade:
           return completed ? "Upgraded Kubernetes Overrides " : "Upgrading Kubernetes Overrides ";
+        case EditKubernetesUniverse:
+          return completed ? "Edited Kubernetes Universe  " : "Editing Kubernetes Universe";
         case CertsRotate:
           return completed ? "Updated Certificates " : "Updating Certificates ";
         case TlsToggle:
@@ -322,10 +429,10 @@ public class CustomerTask extends Model {
           return completed ? "Upgraded Software " : "Upgrading Software ";
         case UpdateDiskSize:
           return completed ? "Updated Disk Size " : "Updating Disk Size ";
+        case UpdateLoadBalancerConfig:
+          return completed ? "Updated Load Balancer Config " : "Updating Load Balancer Config ";
         case UpdateCert:
           return completed ? "Updated Cert " : "Updating Cert ";
-        case ToggleTls:
-          return completed ? "Toggled Tls " : "Toggling Tls ";
         case UpgradeGflags:
           return completed ? "Upgraded GFlags " : "Upgrading GFlags ";
         case BulkImportData:
@@ -334,8 +441,10 @@ public class CustomerTask extends Model {
           return completed ? "Restored " : "Restoring ";
         case CreatePitrConfig:
           return completed ? "Created PITR Config" : "Creating PITR Config";
-        case RestoreSnapshot:
-          return completed ? "Restored Snapshot" : "Restoring Snapshot";
+        case DeletePitrConfig:
+          return completed ? "Deleted PITR Config" : "Deleting PITR Config";
+        case RestoreSnapshotSchedule:
+          return completed ? "Restored Snapshot Schedule" : "Restoring Snapshot Schedule";
         case Restart:
           return completed ? "Restarted " : "Restarting ";
         case Backup:
@@ -347,9 +456,7 @@ public class CustomerTask extends Model {
         case SetActiveUniverseKeys:
           return completed ? "Set active universe keys" : "Setting active universe keys";
         case RotateEncryptionKey:
-          return completed
-              ? "Rotated encryption at rest universe key"
-              : "Rotating encryption at rest universe key";
+          return completed ? "Rotated encryption at rest" : "Rotating encryption at rest";
         case DisableEncryptionAtRest:
           return completed ? "Disabled encryption at rest" : "Disabling encryption at rest";
         case StartMaster:
@@ -368,6 +475,10 @@ public class CustomerTask extends Model {
           return completed ? "Edited xcluster config " : "Editing xcluster config ";
         case SyncXClusterConfig:
           return completed ? "Synchronized xcluster config " : "Synchronizing xcluster config ";
+        case Failover:
+          return completed ? "Failed over dr config " : "Failing over dr config ";
+        case Switchover:
+          return completed ? "Switched over dr config " : "Switching over dr config ";
         case PrecheckNode:
           return completed ? "Performed preflight check on " : "Performing preflight check on ";
         case Abort:
@@ -378,6 +489,10 @@ public class CustomerTask extends Model {
           return completed
               ? "Upgraded third-party software for "
               : "Upgrading third-party software for ";
+        case ModifyAuditLoggingConfig:
+          return completed
+              ? "Modified audit logging config for "
+              : "Modifying audit logging config for ";
         case CreateTableSpaces:
           return completed ? "Created tablespaces in " : "Creating tablespaces in ";
         case RotateAccessKey:
@@ -392,10 +507,25 @@ public class CustomerTask extends Model {
           return completed ? "Ran API Triggered Hooks" : "Running API Triggered Hooks";
         case InstallYbcSoftware:
           return completed ? "Installed Ybc" : "Installing Ybc";
+        case InstallYbcSoftwareOnK8s:
+          return completed ? "Installed Ybc on K8S" : "Installing Ybc on K8S";
         case UpgradeUniverseYbc:
           return completed ? "Upgraded Ybc" : "Upgrading Ybc";
         case DisableYbc:
           return completed ? "Disabled Ybc" : "Disabling Ybc";
+        case UpgradeYbcGFlags:
+          return completed ? "Upgraded Ybc GFlags" : "Upgrading Ybc GFlags";
+        case ConfigureDBApisKubernetes:
+        case ConfigureDBApis:
+          return completed ? "Configured DB APIs" : "Configuring DB APIs";
+        case CreateImageBundle:
+          return completed ? "Created" : "Creating";
+        case ReprovisionNode:
+          return completed ? "Reprovisioned" : "Reprovisioning";
+        case Install:
+          return completed ? "Installed" : "Installing";
+        case UpdateProxyConfig:
+          return completed ? "Updated Proxy Config" : "Updating Proxy Config";
         default:
           return null;
       }
@@ -425,6 +555,8 @@ public class CustomerTask extends Model {
           return "Reboot";
         case RestartUniverse:
           return "Restart";
+        case ReprovisionNode:
+          return "Re-provision";
         default:
           return toFriendlyTypeName();
       }
@@ -441,26 +573,20 @@ public class CustomerTask extends Model {
   @ApiModelProperty(value = "Customer task UUID", accessMode = READ_ONLY)
   private Long id;
 
-  public Long getId() {
-    return id;
-  }
-
   @Constraints.Required
   @Column(nullable = false)
   @ApiModelProperty(value = "Customer UUID", accessMode = READ_ONLY, required = true)
   private UUID customerUUID;
-
-  public UUID getCustomerUUID() {
-    return customerUUID;
-  }
 
   @Constraints.Required
   @Column(nullable = false)
   @ApiModelProperty(value = "Task UUID", accessMode = READ_ONLY, required = true)
   private UUID taskUUID;
 
-  public UUID getTaskUUID() {
-    return taskUUID;
+  public CustomerTask updateTaskUUID(UUID newTaskUUID) {
+    this.taskUUID = newTaskUUID;
+    save();
+    return this;
   }
 
   @Constraints.Required
@@ -468,40 +594,24 @@ public class CustomerTask extends Model {
   @ApiModelProperty(value = "Task type", accessMode = READ_ONLY, required = true)
   private TaskType type;
 
-  public TaskType getType() {
-    return type;
-  }
-
   @Constraints.Required
   @Column(nullable = false)
   @ApiModelProperty(value = "Task target type", accessMode = READ_ONLY, required = true)
   private TargetType targetType;
-
-  public TargetType getTarget() {
-    return targetType;
-  }
 
   @Constraints.Required
   @Column(nullable = false)
   @ApiModelProperty(value = "Task target name", accessMode = READ_ONLY, required = true)
   private String targetName;
 
-  public String getTargetName() {
-    return targetName;
-  }
-
   @Constraints.Required
   @Column(nullable = false)
   @ApiModelProperty(value = "Task target UUID", accessMode = READ_ONLY, required = true)
   private UUID targetUUID;
 
-  public UUID getTargetUUID() {
-    return targetUUID;
-  }
-
   @Constraints.Required
   @Column(nullable = false)
-  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ssZ")
+  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ss'Z'")
   @ApiModelProperty(
       value = "Creation time",
       accessMode = READ_ONLY,
@@ -509,29 +619,36 @@ public class CustomerTask extends Model {
       required = true)
   private Date createTime;
 
-  public Date getCreateTime() {
-    return createTime;
-  }
-
   @Column
-  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ssZ")
+  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ss'Z'")
   @ApiModelProperty(
       value = "Completion time (present only if a task has completed)",
       accessMode = READ_ONLY,
       example = "2021-06-17T15:00:05-0400")
   private Date completionTime;
 
-  public Date getCompletionTime() {
-    return completionTime;
+  public void resetCompletionTime() {
+    this.completionTime = null;
+    this.save();
   }
 
   @Column
   @ApiModelProperty(value = "Custom type name", accessMode = READ_ONLY, example = "TLS Toggle ON")
   private String customTypeName;
 
-  public String getCustomTypeName() {
-    return customTypeName;
-  }
+  @Column
+  @ApiModelProperty(
+      value = "Correlation id",
+      accessMode = READ_ONLY,
+      example = "3e6ac43a-15d9-46c0-831c-460775ce87ad")
+  private String correlationId;
+
+  @Column
+  @ApiModelProperty(
+      value = "User triggering task",
+      accessMode = READ_ONLY,
+      example = "shagarwal@yugabyte.com")
+  private String userEmail;
 
   public void markAsCompleted() {
     markAsCompleted(new Date());
@@ -545,6 +662,12 @@ public class CustomerTask extends Model {
     }
   }
 
+  private static final Set<TaskType> upgradeCustomerTasksSet =
+      ImmutableSet.of(
+          CustomerTask.TaskType.FinalizeUpgrade,
+          CustomerTask.TaskType.RollbackUpgrade,
+          CustomerTask.TaskType.SoftwareUpgrade);
+
   public static final Finder<Long, CustomerTask> find =
       new Finder<Long, CustomerTask>(CustomerTask.class) {};
 
@@ -555,9 +678,10 @@ public class CustomerTask extends Model {
       TargetType targetType,
       TaskType type,
       String targetName,
-      @Nullable String customTypeName) {
+      @Nullable String customTypeName,
+      @Nullable String userEmail) {
     CustomerTask th = new CustomerTask();
-    th.customerUUID = customer.uuid;
+    th.customerUUID = customer.getUuid();
     th.targetUUID = targetUUID;
     th.taskUUID = taskUUID;
     th.targetType = targetType;
@@ -565,6 +689,24 @@ public class CustomerTask extends Model {
     th.targetName = targetName;
     th.createTime = new Date();
     th.customTypeName = customTypeName;
+    String emailFromContext = Util.maybeGetEmailFromContext();
+    if (emailFromContext.equals("Unknown")) {
+      // When task is not created as a part of user action get email of the scheduler.
+      String emailFromSchedule = maybeGetEmailFromSchedule();
+      if (emailFromSchedule.equals("Unknown")) {
+        if (!StringUtils.isEmpty(userEmail)) {
+          th.userEmail = userEmail;
+        } else {
+          th.userEmail = "Unknown";
+        }
+      } else {
+        th.userEmail = emailFromSchedule;
+      }
+    } else {
+      th.userEmail = emailFromContext;
+    }
+    String correlationId = (String) MDC.get(LogUtil.CORRELATION_ID);
+    if (!Strings.isNullOrEmpty(correlationId)) th.correlationId = correlationId;
     th.save();
     return th;
   }
@@ -579,8 +721,24 @@ public class CustomerTask extends Model {
     return create(customer, targetUUID, taskUUID, targetType, type, targetName, null);
   }
 
+  public static CustomerTask create(
+      Customer customer,
+      UUID targetUUID,
+      UUID taskUUID,
+      TargetType targetType,
+      TaskType type,
+      String targetName,
+      @Nullable String customTypeName) {
+    return create(
+        customer, targetUUID, taskUUID, targetType, type, targetName, customTypeName, null);
+  }
+
   public static CustomerTask get(Long id) {
     return CustomerTask.find.query().where().idEq(id).findOne();
+  }
+
+  public static List<CustomerTask> getByCustomerUUID(UUID customerUUID) {
+    return CustomerTask.find.query().where().eq("customer_uuid", customerUUID).findList();
   }
 
   @Deprecated
@@ -610,7 +768,7 @@ public class CustomerTask extends Model {
   }
 
   /**
-   * deletes customer_task, task_info and all its subtasks of a given task. Assumes task_info tree
+   * Deletes customer_task, task_info and all its subtasks of a given task. Assumes task_info tree
    * is one level deep. If this assumption changes then this code needs to be reworked to recurse.
    * When successful; it deletes at least 2 rows because there is always customer_task and
    * associated task_info row that get deleted.
@@ -622,7 +780,12 @@ public class CustomerTask extends Model {
   public int cascadeDeleteCompleted() {
     Preconditions.checkNotNull(
         completionTime, String.format("CustomerTask %s has not completed", id));
-    TaskInfo rootTaskInfo = TaskInfo.get(taskUUID);
+    Optional<TaskInfo> optional = TaskInfo.maybeGet(taskUUID);
+    if (!optional.isPresent()) {
+      delete();
+      return 1;
+    }
+    TaskInfo rootTaskInfo = optional.get();
     if (!rootTaskInfo.hasCompleted()) {
       LOG.warn(
           "Completed CustomerTask(id:{}, type:{}) has incomplete task_info {}",
@@ -631,23 +794,18 @@ public class CustomerTask extends Model {
           rootTaskInfo);
       return 0;
     }
-    List<TaskInfo> subTasks = rootTaskInfo.getSubTasks();
-    List<TaskInfo> incompleteSubTasks =
-        subTasks.stream().filter(taskInfo -> !taskInfo.hasCompleted()).collect(Collectors.toList());
-    if (rootTaskInfo.getTaskState() == TaskInfo.State.Success && !incompleteSubTasks.isEmpty()) {
-      LOG.warn(
-          "For a customer_task.id: {}, Successful task_info.uuid ({}) has {} incomplete subtasks {}",
-          id,
-          rootTaskInfo.getTaskUUID(),
-          incompleteSubTasks.size(),
-          incompleteSubTasks);
-      return 0;
-    }
-    // Note: delete leaf nodes first to preserve referential integrity.
-    subTasks.forEach(Model::delete);
+    int subTaskSize = rootTaskInfo.getSubTasks().size();
+    deleteTasks(rootTaskInfo);
+    delete();
+    return 2 + subTaskSize;
+  }
+
+  @Transactional
+  // This is in a transaction block to not lose the parent task UUID.
+  private void deleteTasks(TaskInfo rootTaskInfo) {
     rootTaskInfo.delete();
-    this.delete();
-    return 2 + subTasks.size();
+    // TODO This is needed temporarily if the migration to add the FK constraint is skipped.
+    rootTaskInfo.getSubTasks().stream().forEach(TaskInfo::delete);
   }
 
   public static CustomerTask findByTaskUUID(UUID taskUUID) {
@@ -658,20 +816,45 @@ public class CustomerTask extends Model {
     Date cutoffDate = new Date(Instant.now().minus(duration).toEpochMilli());
     return find.query()
         .where()
-        .eq("customerUUID", customer.uuid)
+        .eq("customerUUID", customer.getUuid())
         .le("completion_time", cutoffDate)
         .findList();
+  }
+
+  public static Optional<CustomerTask> maybeGetByTargetUUIDTaskTypeTargetType(
+      UUID customerUUID, UUID targetUUID, TaskType taskType, TargetType targetType) {
+    List<CustomerTask> cTaskList =
+        CustomerTask.find
+            .query()
+            .where()
+            .eq("customer_uuid", customerUUID)
+            .eq("type", taskType)
+            .eq("target_type", targetType)
+            .eq("target_uuid", targetUUID)
+            .orderBy("create_time desc")
+            .findList();
+    return CollectionUtils.isEmpty(cTaskList) ? Optional.empty() : Optional.of(cTaskList.get(0));
+  }
+
+  public static Optional<UUID> maybeGetIdenticalIncompleteTaskUUID(
+      UUID customerUUID, UUID targetUUID, TaskType taskType, TargetType targetType) {
+    Optional<CustomerTask> oCustTask =
+        maybeGetByTargetUUIDTaskTypeTargetType(customerUUID, targetUUID, taskType, targetType);
+    if (oCustTask.isPresent() && oCustTask.get().getCompletionTime() == null) {
+      return Optional.of(oCustTask.get().getTaskUUID());
+    }
+    return Optional.empty();
   }
 
   public static List<CustomerTask> findIncompleteByTargetUUID(UUID targetUUID) {
     return find.query().where().eq("target_uuid", targetUUID).isNull("completion_time").findList();
   }
 
-  public static CustomerTask getLatestByUniverseUuid(UUID universeUUID) {
+  public static CustomerTask getLastTaskByTargetUuid(UUID targetUUID) {
     List<CustomerTask> tasks =
         find.query()
             .where()
-            .eq("target_uuid", universeUUID)
+            .eq("target_uuid", targetUUID)
             .isNotNull("completion_time")
             .orderBy("completion_time desc")
             .setMaxRows(1)
@@ -683,11 +866,57 @@ public class CustomerTask extends Model {
     }
   }
 
+  @JsonIgnore
   public String getNotificationTargetName() {
-    if (getType().equals(TaskType.Create) && getTarget().equals(TargetType.Backup)) {
-      return Universe.getOrBadRequest(getTargetUUID()).name;
+    if (getType().equals(TaskType.Create) && getTargetType().equals(TargetType.Backup)) {
+      return Universe.getOrBadRequest(getTargetUUID()).getName();
     } else {
       return getTargetName();
     }
+  }
+
+  private static String maybeGetEmailFromSchedule() {
+    return Schedule.getAllActive().stream()
+        .filter(Schedule::isRunningState)
+        .findAny()
+        .map(Schedule::getUserEmail)
+        .orElse("Unknown");
+  }
+
+  public boolean isDeletable() {
+    if (targetType.isUniverseTarget()) {
+      Optional<Universe> optional = Universe.maybeGet(targetUUID);
+      if (!optional.isPresent()) {
+        return true;
+      }
+      if (upgradeCustomerTasksSet.contains(type)) {
+        LOG.debug("Universe task {} is not deletable as it is an upgrade task.", targetUUID);
+        return false;
+      }
+      UniverseDefinitionTaskParams taskParams = optional.get().getUniverseDetails();
+      if (taskUUID.equals(taskParams.updatingTaskUUID)) {
+        LOG.debug("Universe task {} is not deletable", targetUUID);
+        return false;
+      }
+      if (taskUUID.equals(taskParams.placementModificationTaskUuid)) {
+        LOG.debug("Universe task {} is not deletable", targetUUID);
+        return false;
+      }
+    } else if (targetType == TargetType.Provider) {
+      Optional<Provider> optional = Provider.maybeGet(targetUUID);
+      if (!optional.isPresent()) {
+        return true;
+      }
+      CustomerTask lastTask = CustomerTask.getLastTaskByTargetUuid(targetUUID);
+      if (lastTask == null) {
+        // Not possible.
+        return true;
+      }
+      if (taskUUID.equals(lastTask.taskUUID)) {
+        LOG.debug("Provider task {} is not deletable", targetUUID);
+        return false;
+      }
+    }
+    return true;
   }
 }

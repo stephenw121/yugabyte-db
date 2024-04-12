@@ -3,7 +3,6 @@ title: Explore YSQL, the Yugabyte SQL API
 headerTitle: Explore Yugabyte SQL
 linkTitle: Explore distributed SQL APIs
 description: Explore Yugabyte SQL (YSQL), a PostgreSQL-compatible fully-relational distributed SQL API
-image: /images/section_icons/quick_start/explore_ysql.png
 aliases:
   - /preview/quick-start/explore-ysql/
   - /preview/quick-start/explore/
@@ -54,25 +53,25 @@ Using the YugabyteDB SQL shell, [ysqlsh](../../../admin/ysqlsh/), you can connec
 <ul class="nav nav-tabs nav-tabs-yb">
   <li >
     <a href="#macos" class="nav-link active" id="macos-tab" data-toggle="tab" role="tab" aria-controls="macos" aria-selected="true">
-      <i class="fab fa-apple" aria-hidden="true"></i>
+      <i class="fa-brands fa-apple" aria-hidden="true"></i>
       macOS
     </a>
   </li>
   <li>
     <a href="#linux" class="nav-link" id="linux-tab" data-toggle="tab" role="tab" aria-controls="linux" aria-selected="false">
-      <i class="fab fa-linux" aria-hidden="true"></i>
+      <i class="fa-brands fa-linux" aria-hidden="true"></i>
       Linux
     </a>
   </li>
   <li>
     <a href="#docker" class="nav-link" id="docker-tab" data-toggle="tab" role="tab" aria-controls="docker" aria-selected="false">
-      <i class="fab fa-docker" aria-hidden="true"></i>
+      <i class="fa-brands fa-docker" aria-hidden="true"></i>
       Docker
     </a>
   </li>
   <li >
     <a href="#kubernetes" class="nav-link" id="kubernetes-tab" data-toggle="tab" role="tab" aria-controls="kubernetes" aria-selected="false">
-      <i class="fas fa-cubes" aria-hidden="true"></i>
+      <i class="fa-regular fa-dharmachakra" aria-hidden="true"></i>
       Kubernetes
     </a>
   </li>
@@ -328,7 +327,7 @@ Use a [prepared statement](../../../api/ysql/the-sql-language/statements/perf_pr
 
 ### Indexes
 
-Use [indexes](../../../explore/indexes-constraints/secondary-indexes/) to query table values more efficiently.
+Use [indexes](../../../explore/ysql-language-features/indexes-constraints/secondary-indexes-ysql/) to query table values more efficiently.
 
 1. Create a table with randomly generated rows. You can use the `generate_series()` function to generate rows. The following uses `generate_series()` to create a table with 42 rows and a random value from 1 to 10:
 
@@ -519,7 +518,7 @@ SELECT * FROM emp_evaluation_period e1
 
 ### Cross table pivots
 
-Use a cross table to show the sum of salary per job, by department. The shell [\crosstabview](../../../admin/ysqlsh/#crosstabview-colv-colh-cold-sortcolh) meta-command displays rows as columns. The following statement sums the salaries across jobs and departments and displays them as a cross table:
+Use a cross table to show the sum of salary per job, by department. The shell [\crosstabview](../../../admin/ysqlsh-meta-commands/#crosstabview-colv-colh-cold-sortcolh) meta-command displays rows as columns. The following statement sums the salaries across jobs and departments and displays them as a cross table:
 
 ```sql
 SELECT job, dname, sum(sal)
@@ -564,7 +563,7 @@ FROM groups GROUP BY group_num;
 
 ### GIN index on documents
 
-The employee skills are stored in a semi-structured JSON document. You can query them using the `@>`, `?`, `?&`, and `?|` operators. For best performance, index them using a [GIN index](../../../explore/indexes-constraints/gin/). GIN indexes provide quick access to elements inside a JSON document.
+The employee skills are stored in a semi-structured JSON document. You can query them using the `@>`, `?`, `?&`, and `?|` operators. For best performance, index them using a [GIN index](../../../explore/ysql-language-features/indexes-constraints/gin/). GIN indexes provide quick access to elements inside a JSON document.
 
 (GIN indexes are only available in YugabyteDB v2.11.0 or later. If you are using an earlier version, skip this scenario.)
 

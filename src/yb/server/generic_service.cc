@@ -42,9 +42,7 @@
 
 #include <boost/preprocessor/cat.hpp>
 #include <boost/preprocessor/stringize.hpp>
-#include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/atomicops.h"
 #include "yb/gutil/callback_forward.h"
@@ -56,7 +54,6 @@
 #include "yb/rpc/rpc_context.h"
 #include "yb/server/clock.h"
 #include "yb/server/server_base.h"
-#include "yb/util/flag_tags.h"
 #include "yb/util/flags.h"
 #include "yb/util/metrics_fwd.h"
 #include "yb/util/monotime.h"
@@ -65,7 +62,6 @@
 #include "yb/util/status_fwd.h"
 
 using std::string;
-using std::unordered_set;
 
 DECLARE_string(flagfile);
 DECLARE_string(vmodule);
@@ -89,8 +85,10 @@ GenericServiceImpl::~GenericServiceImpl() {
 void GenericServiceImpl::SetFlag(const SetFlagRequestPB* req,
                                  SetFlagResponsePB* resp,
                                  rpc::RpcContext rpc) {
+  using flags_internal::SetFlagForce;
+  using flags_internal::SetFlagResult;
   LOG(INFO) << rpc.requestor_string() << " changing flag via RPC: " << req->flag();
-  const auto res = ::yb::SetFlag(
+  const auto res = ::yb::flags_internal::SetFlag(
       req->flag(), req->value(), SetFlagForce(req->force()), resp->mutable_old_value(),
       resp->mutable_msg());
 
@@ -106,9 +104,6 @@ void GenericServiceImpl::SetFlag(const SetFlagRequestPB* req,
       break;
     case SetFlagResult::NOT_SAFE:
       resp->set_result(SetFlagResponsePB::NOT_SAFE);
-      break;
-    case SetFlagResult::PG_SET_FAILED:
-      resp->set_result(SetFlagResponsePB::PG_SET_FAILED);
       break;
     default:
       FATAL_INVALID_ENUM_VALUE(SetFlagResult, res);

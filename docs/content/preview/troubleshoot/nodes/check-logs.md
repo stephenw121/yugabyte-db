@@ -21,7 +21,7 @@ The logs for each node are written to a subdirectory of the YugabyteDB `yugabyte
 - When using the `--fs_data_dirs` flag with multiple directories, logs are saved in the first directory in the list.
 - When using YugabyteDB Anywhere, logs are located in `/home/yugabyte/{master,tserver}/logs`. This is a symlink to the first directory in `--fs_data_dirs` list.
 - When using the Docker container, logs are located in `/root/var/logs` inside the container.
-- When using the `yugabyted` command-line interface to create the local YugabyteDB cluster, logs are located in `~/var/logs`.
+- When using the `yugabyted` command-line interface to create the local YugabyteDB cluster, by default logs are located in `~/var/logs`.
 
 In this document, the YugabyteDB `yugabyte-data` directory is represented by `<yugabyte-data-directory>`.
 
@@ -49,7 +49,7 @@ Logs are organized by error severity: `FATAL`, `ERROR`, `WARNING`, `INFO`.
 
 For YB-Master and YB-TServer, the log rotation size is controlled by the `--max_log_size` flag. For example, setting this flag to 256 limits each file to 256 MB. The default size is 1.8 GB.
 
-For YSQL, there are additional `postgres*log` files that have daily-based and size-based log rotation. That is, a new log file is created evert day or when a log reaches 10 MB in size.
+For YSQL, there are additional `postgres*log` files that have daily-based and size-based log rotation. That is, a new log file is created every day or when a log reaches 10 MB in size.
 
 For information on available configuration flags, see [YB-Master logging flags](../../../reference/configuration/yb-master/#logging-flags) and [YB-TServer logging flags](../../../reference/configuration/yb-tserver/#logging-flags).
 

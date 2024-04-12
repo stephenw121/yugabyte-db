@@ -2,16 +2,17 @@
 title: Expressions and operators
 linkTitle: Expressions and operators
 description: Expressions and operators in YSQL
-image: /images/section_icons/secure/create-roles.png
 menu:
   preview:
     identifier: explore-ysql-language-features-expressions-operators
     parent: explore-ysql-language-features
-    weight: 215
+    weight: 205
 type: docs
 ---
 
 This document describes how to use boolean, numeric, and date expressions, as well as basic operators. In addition, it provides information on conditional expression and operators.
+
+{{% explore-setup-single %}}
 
 ## Basic operators
 

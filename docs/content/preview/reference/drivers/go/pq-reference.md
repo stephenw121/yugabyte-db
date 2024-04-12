@@ -1,9 +1,9 @@
 ---
-title: Go Drivers
+title: PQ Driver
+headerTitle: Go Drivers
 linkTitle: Go Drivers
-description: Go Drivers for YSQL
+description: Go PQ Driver for YSQL
 headcontent: Go Drivers for YSQL
-image: /images/section_icons/sample-data/s_s1-sampledata-3x.png
 menu:
   preview:
     name: Go Drivers
@@ -39,13 +39,13 @@ type: docs
 
 The [PQ driver](https://github.com/lib/pq/) is a popular driver for PostgreSQL that can used for connecting to YugabyteDB YSQL.
 
-The driver allows Go programmers to connect to YugabyteDB database to execute DMLs and DDLs using the standard `database/sql` package.
+The driver allows Go programmers to connect to YugabyteDB database to execute DMLs and DDLs using the standard `database/sql` package. The driver supports the [SCRAM-SHA-256 authentication method](../../../../secure/authentication/password-authentication/#scram-sha-256).
+
+For a tutorial on building a sample Go application with pq, see [Connect an application](../../../../drivers-orms/go/pq/).
 
 ## Fundamentals
 
-Learn how to establish a connection to YugabyteDB database and begin basic CRUD operations using the steps in [Build an application](../../../../develop/build-apps/go/ysql-pq).
-
-What follows breaks down the quick start example to understand how to perform common tasks required for Go application development using the PQ driver.
+Learn how to perform common tasks required for Go application development using the YugabyteDB PQ driver.
 
 ### Import the driver package
 
@@ -55,6 +55,17 @@ Import the PQ driver package by adding the following import statement in your Go
 import (
   _ "github.com/lib/pq"
 )
+```
+
+To install the package locally, run the following commands:
+
+{{< note title="Note">}}
+Set the  environment variable `GO111MODULE` before installing the `lib/pq` package if your Go version is 1.11 or higher.
+{{< /note >}}
+
+```sh
+export GO111MODULE=auto
+go get github.com/lib/pq
 ```
 
 ### Connect to YugabyteDB database
@@ -198,14 +209,20 @@ $ export PGSSLROOTCERT=~/root.crt  # Here, the CA certificate file is downloaded
 
 ### SSL modes
 
+Install [OpenSSL](https://www.openssl.org/) 1.1.1 or later only if you have a YugabyteDB setup with SSL/TLS enabled. YugabyteDB Managed clusters are always SSL/TLS enabled.
+
+The following table summarizes the SSL modes and their support in the driver:
+
 | SSL Mode | Client Driver Behavior | YugabyteDB Support |
 | :------- | :--------------------- | ------------------ |
 | disable  | SSL Disabled | Supported
-| allow    | SSL enabled only if server requires SSL connection | Not supported
-| prefer (default) | SSL enabled only if server requires SSL connection | Not supported
+| allow    | SSL enabled only if server requires SSL connection | Supported
+| prefer (default) | SSL enabled only if server requires SSL connection | Supported
 | require | SSL enabled for data encryption and Server identity is not verified | Supported
 | verify-ca | SSL enabled for data encryption and Server CA is verified | Supported
 | verify-full | SSL enabled for data encryption. Both CA and hostname of the certificate are verified | Supported
+
+YugabyteDB Managed requires SSL/TLS, and connections using SSL mode `disable` will fail.
 
 ## Transaction and isolation levels
 

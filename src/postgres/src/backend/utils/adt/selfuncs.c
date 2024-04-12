@@ -284,8 +284,18 @@ eqsel_internal(PG_FUNCTION_ARGS, bool negate)
 							 ((Const *) other)->constisnull,
 							 varonleft, negate);
 	else
+	{
+		bool yb_is_batched = IsYugaByteEnabled() && IsA(other, YbBatchedExpr);
+
 		selec = var_eq_non_const(&vardata, operator, other,
 								 varonleft, negate);
+
+		if (yb_is_batched)
+		{
+			selec *= yb_batch_expr_size(root, varRelid, other);
+			CLAMP_PROBABILITY(selec);
+		}
+	}
 
 	ReleaseVariableStats(vardata);
 
@@ -2228,7 +2238,8 @@ rowcomparesel(PlannerInfo *root,
 	bool		is_join_clause;
 
 	/* Build equivalent arg list for single operator */
-	opargs = list_make2(linitial(clause->largs), linitial(clause->rargs));
+	opargs = list_make2(linitial(clause->largs),
+		linitial(castNode(List, clause->rargs)));
 
 	/*
 	 * Decide if it's a join clause.  This should match clausesel.c's
@@ -6594,6 +6605,17 @@ deconstruct_indexquals(IndexPath *path)
 				   *rightop;
 		IndexQualInfo *qinfo;
 
+		if (IsYugaByteEnabled() && path->path.param_info &&
+			 yb_enable_base_scans_cost_model)
+		{
+			Relids batched = YB_PATH_REQ_OUTER_BATCHED(&path->path);
+			RestrictInfo *batched_rinfo =
+				yb_get_batched_restrictinfo(rinfo,
+					batched, path->path.parent->relids);
+			if (batched_rinfo)
+				rinfo = batched_rinfo;
+		}
+
 		clause = rinfo->clause;
 
 		qinfo = (IndexQualInfo *) palloc(sizeof(IndexQualInfo));
@@ -6611,7 +6633,7 @@ deconstruct_indexquals(IndexPath *path)
 				qinfo->varonleft = true;
 				qinfo->other_operand = rightop;
 
-				if (IsA(leftop, FuncExpr))
+				if (IsYugaByteEnabled() && IsA(leftop, FuncExpr))
 				{
 					qinfo->is_hashed =
 						(((FuncExpr*) leftop)->funcid == YB_HASH_CODE_OID);
@@ -6677,8 +6699,9 @@ deconstruct_indexquals(IndexPath *path)
 			}
 			else
 			{
-				Assert(match_index_to_operand((Node *) linitial(rc->rargs),
-											  indexcol, index));
+				Assert(match_index_to_operand(
+					(Node *) linitial(castNode(List, rc->rargs)),
+						indexcol, index));
 				qinfo->varonleft = false;
 				qinfo->other_operand = (Node *) rc->largs;
 			}
@@ -6711,6 +6734,27 @@ deconstruct_indexquals(IndexPath *path)
 		result = lappend(result, qinfo);
 	}
 	return result;
+}
+
+int
+yb_batch_expr_size(PlannerInfo *root, Index path_relid, Node *batched_expr)
+{
+	Assert(IsA(batched_expr, YbBatchedExpr));
+	Node *batched_operand =
+		(Node *) castNode(YbBatchedExpr, batched_expr)->orig_expr;
+	Relids other_varnos = pull_varnos(batched_operand);
+	Relids batched_relids = root->yb_cur_batched_relids;
+	root->yb_cur_batched_relids = NULL;
+
+	int num_outer_tuples =
+		get_loop_count(root, path_relid, other_varnos);
+
+	root->yb_cur_batched_relids = batched_relids;
+	int batch_size = yb_bnl_batch_size;
+	if (batch_size > num_outer_tuples)
+		batch_size = num_outer_tuples;
+
+	return batch_size;
 }
 
 /*
@@ -7011,7 +7055,6 @@ add_predicate_to_quals(IndexOptInfo *index, List *indexQuals)
 	/* list_concat avoids modifying the passed-in indexQuals list */
 	return list_concat(predExtraQuals, indexQuals);
 }
-
 
 void
 btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
@@ -7565,6 +7608,20 @@ gincost_pattern(IndexOptInfo *index, int indexcol,
 		return false;
 	}
 
+	if (IsYugaByteEnabled() && index->relam == YBGIN_AM_OID &&
+		searchMode != GIN_SEARCH_MODE_DEFAULT)
+	{
+		/*
+		 * TODO(#7850): for ybgin, non-default search mode queries aren't
+		 * supported yet.
+		 *
+		 * Piggyback on haveFullScan, which the caller translates to
+		 * disable_cost.
+		 */
+		counts->haveFullScan = true;
+		return true;
+	}
+
 	for (i = 0; i < nentries; i++)
 	{
 		/*
@@ -7804,6 +7861,18 @@ gincostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	/* Do preliminary analysis of indexquals */
 	qinfos = deconstruct_indexquals(path);
 
+	if (IsYugaByteEnabled() && index->relam == YBGIN_AM_OID &&
+		list_length(qinfos) > 1)
+	{
+		/*
+		 * TODO(#7850): for ybgin, queries using multiple scan keys aren't
+		 * supported yet.
+		 */
+		*indexStartupCost = *indexTotalCost =
+			yb_test_ybgin_disable_cost_factor * disable_cost;
+		return;
+	}
+
 	/*
 	 * Obtain statistical information from the meta page, if possible.  Else
 	 * set ginStats to zeroes, and we'll cope below.
@@ -7967,6 +8036,16 @@ gincostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 
 	if (counts.haveFullScan || indexQuals == NIL)
 	{
+		if (IsYugaByteEnabled() && index->relam == YBGIN_AM_OID)
+		{
+			/*
+			 * TODO(#7850): for ybgin, full scan is not supported.
+			 */
+			*indexStartupCost = *indexTotalCost =
+				yb_test_ybgin_disable_cost_factor * disable_cost;
+			return;
+		}
+
 		/*
 		 * Full index scan will be required.  We treat this as if every key in
 		 * the index had been listed in the query; is that reasonable?

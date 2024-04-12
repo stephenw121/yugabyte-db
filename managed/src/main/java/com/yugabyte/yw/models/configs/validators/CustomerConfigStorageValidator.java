@@ -51,7 +51,7 @@ public class CustomerConfigStorageValidator extends ConfigDataValidator {
       String fieldName, String value, boolean emptyAllowed, boolean validatePort) {
     if (StringUtils.isEmpty(value)) {
       if (!emptyAllowed) {
-        throwBeanValidatorError(fieldName, "This field is required.");
+        throwBeanConfigDataValidatorError(fieldName, "This field is required.");
       }
       return;
     }
@@ -66,13 +66,13 @@ public class CustomerConfigStorageValidator extends ConfigDataValidator {
         String host = uri.getHost();
         String scheme = uri.getScheme() + "://";
         String uriToValidate = scheme + host;
-        Integer port = Integer.valueOf(uri.getPort());
+        Integer port = uri.getPort();
         boolean validPort = true;
         if (!uri.toString().equals(uriToValidate)
             && (port < MIN_PORT_VALUE
                 || port > MAX_PORT_VALUE
-                || port == HTTPS_PORT
-                || port == HTTP_PORT)) {
+                || HTTPS_PORT.equals(port)
+                || HTTP_PORT.equals(port))) {
           validPort = false;
         }
         valid = validPort && urlValidator.isValid(uriToValidate);
@@ -86,7 +86,7 @@ public class CustomerConfigStorageValidator extends ConfigDataValidator {
 
     if (!valid) {
       String errorMsg = "Invalid field value '" + value + "'";
-      throwBeanValidatorError(fieldName, errorMsg);
+      throwBeanConfigDataValidatorError(fieldName, errorMsg);
     }
   }
 }

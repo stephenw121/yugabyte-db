@@ -41,8 +41,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef YB_SERVER_DEFAULT_PATH_HANDLERS_H
-#define YB_SERVER_DEFAULT_PATH_HANDLERS_H
+#pragma once
+
+#include "yb/server/webserver.h"
 
 namespace yb {
 
@@ -58,6 +59,9 @@ class RpcServerBase;
 // logs and configuration flags.
 void AddDefaultPathHandlers(Webserver* webserver);
 
+// Prints out memory allocation statistics.
+void MemUsageHandler(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
+
 // Adds an endpoint to get metrics in JSON format.
 void RegisterMetricsJsonHandler(Webserver* webserver, const MetricRegistry* const metrics);
 
@@ -67,5 +71,3 @@ void RegisterPathUsageHandler(Webserver* webserver, FsManager* fsmanager);
 void RegisterTlsHandler(Webserver* webserver, server::RpcServerBase* server);
 
 } // namespace yb
-
-#endif // YB_SERVER_DEFAULT_PATH_HANDLERS_H

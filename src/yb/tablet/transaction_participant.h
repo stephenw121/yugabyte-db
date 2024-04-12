@@ -13,8 +13,7 @@
 //
 //
 
-#ifndef YB_TABLET_TRANSACTION_PARTICIPANT_H
-#define YB_TABLET_TRANSACTION_PARTICIPANT_H
+#pragma once
 
 #include <stdint.h>
 
@@ -27,6 +26,8 @@
 #include <boost/optional/optional.hpp>
 
 #include "yb/common/doc_hybrid_time.h"
+#include "yb/common/opid.h"
+#include "yb/common/opid.pb.h"
 #include "yb/common/transaction.h"
 
 #include "yb/docdb/docdb_fwd.h"
@@ -35,12 +36,12 @@
 
 #include "yb/server/server_fwd.h"
 
+#include "yb/tablet/operations.fwd.h"
 #include "yb/tablet/tablet_fwd.h"
 
 #include "yb/util/enums.h"
 #include "yb/util/math_util.h"
-#include "yb/util/opid.h"
-#include "yb/util/opid.pb.h"
+#include "yb/util/mem_tracker.h"
 
 namespace rocksdb {
 
@@ -69,7 +70,7 @@ namespace tablet {
 struct TransactionApplyData {
   int64_t leader_term = -1;
   TransactionId transaction_id = TransactionId::Nil();
-  AbortedSubTransactionSet aborted;
+  SubtxnSet aborted;
   OpId op_id;
   HybridTime commit_ht;
   HybridTime log_ht;
@@ -77,7 +78,6 @@ struct TransactionApplyData {
   TabletId status_tablet;
   // Owned by running transaction if non-null.
   const docdb::ApplyTransactionState* apply_state = nullptr;
-  bool is_external = false;
 
   std::string ToString() const;
 };
@@ -111,8 +111,12 @@ class TransactionParticipant : public TransactionStatusManager {
  public:
   TransactionParticipant(
       TransactionParticipantContext* context, TransactionIntentApplier* applier,
-      const scoped_refptr<MetricEntity>& entity);
+      const scoped_refptr<MetricEntity>& entity, const std::shared_ptr<MemTracker>& parent);
   virtual ~TransactionParticipant();
+
+  void SetWaitQueue(std::unique_ptr<docdb::WaitQueue> wait_queue);
+
+  docdb::WaitQueue* wait_queue() const;
 
   // Notify participant that this context is ready and it could start performing its requests.
   void Start();
@@ -121,7 +125,8 @@ class TransactionParticipant : public TransactionStatusManager {
   // Returns true if transaction was added, false if transaction already present.
   Result<bool> Add(const TransactionMetadata& metadata);
 
-  Result<TransactionMetadata> PrepareMetadata(const TransactionMetadataPB& pb) override;
+  Result<TransactionMetadata> PrepareMetadata(const LWTransactionMetadataPB& pb) override;
+  Result<TransactionMetadata> PrepareMetadata(const TransactionMetadataPB& pb);
 
   // Prepares batch data for specified transaction id.
   // I.e. adds specified batch idx to set of replicated batches and fills encoded_replicated_batches
@@ -129,14 +134,9 @@ class TransactionParticipant : public TransactionStatusManager {
   // he should just append it to appropriate value.
   //
   // Returns boost::none when transaction is unknown.
-  //
-  // When external_transaction is set for xcluster transactions, the function ignores the start time
-  // of the txn when fetching the transaction since the txn status record and intent bach can come
-  // out of order.
-  boost::optional<std::pair<IsolationLevel, TransactionalBatchData>> PrepareBatchData(
+  Result<boost::optional<std::pair<IsolationLevel, TransactionalBatchData>>> PrepareBatchData(
       const TransactionId& id, size_t batch_idx,
-      boost::container::small_vector_base<uint8_t>* encoded_replicated_batches,
-      bool external_transaction = false);
+      boost::container::small_vector_base<uint8_t>* encoded_replicated_batches);
 
   void BatchReplicated(const TransactionId& id, const TransactionalBatchData& data);
 
@@ -150,12 +150,12 @@ class TransactionParticipant : public TransactionStatusManager {
 
   void Handle(std::unique_ptr<tablet::UpdateTxnOperation> request, int64_t term);
 
-  void Cleanup(TransactionIdSet&& set) override;
+  Status Cleanup(TransactionIdApplyOpIdMap&& set) override;
 
   // Used to pass arguments to ProcessReplicated.
   struct ReplicatedData {
     int64_t leader_term = -1;
-    const TransactionStatePB& state;
+    const LWTransactionStatePB& state;
     const OpId& op_id;
     HybridTime hybrid_time;
     bool sealed = false;
@@ -166,18 +166,16 @@ class TransactionParticipant : public TransactionStatusManager {
 
   Status ProcessReplicated(const ReplicatedData& data);
 
-  void SetDB(
-      const docdb::DocDB& db, const docdb::KeyBounds* key_bounds,
-      RWOperationCounter* pending_op_counter);
+  Status SetDB(
+      const docdb::DocDB& db,
+      RWOperationCounter* pending_op_counter_blocking_rocksdb_shutdown_start);
 
   Status CheckAborted(const TransactionId& id);
 
-  void FillPriorities(
+  Status FillPriorities(
       boost::container::small_vector_base<std::pair<TransactionId, uint64_t>>* inout) override;
 
-  void FillStatusTablets(std::vector<BlockingTransactionData>* inout) override;
-
-  boost::optional<TabletId> FindStatusTablet(const TransactionId& id) override;
+  Result<boost::optional<TabletId>> FindStatusTablet(const TransactionId& id) override;
 
   void GetStatus(const TransactionId& transaction_id,
                  size_t required_num_replicated_batches,
@@ -228,12 +226,26 @@ class TransactionParticipant : public TransactionStatusManager {
 
   OpId GetLatestCheckPoint() const;
 
+  HybridTime GetMinStartTimeAmongAllRunningTransactions() const;
+
+  OpId GetHistoricalMaxOpId() const;
+
   const TabletId& tablet_id() const override;
 
-  size_t TEST_GetNumRunningTransactions() const;
+  void RecordConflictResolutionKeysScanned(int64_t num_keys) override;
 
-  // Returns pair of number of intents and number of transactions.
-  std::pair<size_t, size_t> TEST_CountIntents() const;
+  void RecordConflictResolutionScanLatency(MonoDelta latency) override;
+
+  size_t GetNumRunningTransactions() const;
+
+  struct CountIntentsResult {
+    size_t num_intents;
+    size_t num_transactions;
+    size_t num_post_apply;
+  };
+  // Returns pair of number of intents, number of transactions, and number of post-apply
+  // records.
+  Result<CountIntentsResult> TEST_CountIntents() const;
 
   OneWayBitmap TEST_TransactionReplicatedBatches(const TransactionId& id) const;
 
@@ -247,5 +259,3 @@ class TransactionParticipant : public TransactionStatusManager {
 
 } // namespace tablet
 } // namespace yb
-
-#endif // YB_TABLET_TRANSACTION_PARTICIPANT_H

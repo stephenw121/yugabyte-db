@@ -52,6 +52,10 @@
 #endif
 #endif
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "yb_ysql_conn_mgr_helper.h"
+
 
 #define MAX_TOKEN	256
 #define MAX_LINE	8192
@@ -145,7 +149,8 @@ static const char *const UserAuthName[] =
 	"ldap",
 	"cert",
 	"radius",
-	"peer"
+	"peer",
+	"jwt"
 };
 
 
@@ -1451,6 +1456,8 @@ parse_hba_line(TokenizedLine *tok_line, int elevel)
 #endif
 	else if (strcmp(token->string, "radius") == 0)
 		parsedline->auth_method = uaRADIUS;
+	else if (strcmp(token->string, "jwt") == 0)
+		parsedline->auth_method = uaYbJWT;
 	else
 	{
 		ereport(elevel,
@@ -1697,6 +1704,33 @@ parse_hba_line(TokenizedLine *tok_line, int elevel)
 			return NULL;
 	}
 
+	if (parsedline->auth_method == uaYbJWT) {
+		MANDATORY_AUTH_ARG(parsedline->yb_jwt_jwks_path, "jwt_jwks_path",
+						   "jwt");
+
+		if (list_length(parsedline->yb_jwt_audiences) < 1)
+		{
+			ereport(elevel,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("list of JWT audiences cannot be empty"),
+					 errcontext("line %d of configuration file \"%s\"",
+								line_num, HbaFileName)));
+			*err_msg = "list of JWT audiences cannot be empty";
+			return NULL;
+		}
+
+		if (list_length(parsedline->yb_jwt_issuers) < 1)
+		{
+			ereport(elevel,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("list of JWT issuers cannot be empty"),
+					 errcontext("line %d of configuration file \"%s\"",
+								line_num, HbaFileName)));
+			*err_msg = "list of JWT issuers cannot be empty";
+			return NULL;
+		}
+	}
+
 	/*
 	 * Enforce any parameters implied by other settings.
 	 */
@@ -1797,8 +1831,9 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 			hbaline->auth_method != uaPeer &&
 			hbaline->auth_method != uaGSS &&
 			hbaline->auth_method != uaSSPI &&
-			hbaline->auth_method != uaCert)
-			INVALID_AUTH_OPTION("map", gettext_noop("ident, peer, gssapi, sspi, and cert"));
+			hbaline->auth_method != uaCert &&
+			hbaline->auth_method != uaYbJWT)
+			INVALID_AUTH_OPTION("map", gettext_noop("ident, peer, gssapi, sspi, cert, and jwt"));
 		hbaline->usermap = pstrdup(val);
 	}
 	else if (strcmp(name, "clientcert") == 0)
@@ -2140,6 +2175,65 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 		hbaline->radiusidentifiers = parsed_identifiers;
 		hbaline->radiusidentifiers_s = pstrdup(val);
 	}
+	else if (strcmp(name, "jwt_jwks_path") == 0)
+	{
+		REQUIRE_AUTH_OPTION(uaYbJWT, "jwt_jwks_path", "jwt");
+
+		hbaline->yb_jwt_jwks_path = pstrdup(val);
+	}
+	else if (strcmp(name, "jwt_audiences") == 0)
+	{
+		List	   *parsed_audiences;
+		char	   *dupval = pstrdup(val);
+
+		REQUIRE_AUTH_OPTION(uaYbJWT, "jwt_audiences", "jwt");
+
+		if (!SplitGUCList(dupval, ',', &parsed_audiences))
+		{
+			/* syntax error in list */
+			ereport(elevel,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("could not parse JWT audience list \"%s\"",
+							val),
+					 errcontext("line %d of configuration file \"%s\"",
+								line_num, HbaFileName)));
+			*err_msg = psprintf(
+				"could not parse JWT audience list: \"%s\"", val);
+			return false;
+		}
+
+		hbaline->yb_jwt_audiences = parsed_audiences;
+		hbaline->yb_jwt_audiences_s = pstrdup(val);
+	}
+	else if (strcmp(name, "jwt_issuers") == 0)
+	{
+		List	   *parsed_issuers;
+		char	   *dupval = pstrdup(val);
+
+		REQUIRE_AUTH_OPTION(uaYbJWT, "jwt_issuers", "jwt");
+
+		if (!SplitGUCList(dupval, ',', &parsed_issuers))
+		{
+			/* syntax error in list */
+			ereport(elevel,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("could not parse JWT issuer list \"%s\"",
+							val),
+					 errcontext("line %d of configuration file \"%s\"",
+								line_num, HbaFileName)));
+			*err_msg = psprintf(
+				"could not parse JWT issuer list: \"%s\"", val);
+			return false;
+		}
+
+		hbaline->yb_jwt_issuers = parsed_issuers;
+		hbaline->yb_jwt_issuers_s = pstrdup(val);
+	}
+	else if (strcmp(name, "jwt_matching_claim_key") == 0)
+	{
+		REQUIRE_AUTH_OPTION(uaYbJWT, "jwt_matching_claim_key", "jwt");
+		hbaline->yb_jwt_matching_claim_key = pstrdup(val);
+	}
 	else
 	{
 		ereport(elevel,
@@ -2185,7 +2279,9 @@ check_hba(hbaPort *port)
 				continue;
 
 			/* Check SSL state */
-			if (port->ssl_in_use)
+			if (YbIsClientYsqlConnMgr() && port->yb_is_auth_passthrough_req ?
+					port->yb_is_ssl_enabled_in_logical_conn :
+					port->ssl_in_use)
 			{
 				/* Connection is SSL, match both "host" and "hostssl" */
 				if (hba->conntype == ctHostNoSSL)
@@ -2481,6 +2577,29 @@ gethba_options(HbaLine *hba)
 		if (hba->radiusports_s)
 			options[noptions++] =
 				CStringGetTextDatum(psprintf("radiusports=%s", hba->radiusports_s));
+	}
+
+	if (hba->auth_method == uaYbJWT)
+	{
+		if (hba->yb_jwt_jwks_path)
+			options[noptions++] =
+				CStringGetTextDatum(psprintf("jwt_jwks_path=%s",
+											 hba->yb_jwt_jwks_path));
+
+		if (hba->yb_jwt_audiences_s)
+			options[noptions++] =
+				CStringGetTextDatum(psprintf("jwt_audiences=%s",
+											 hba->yb_jwt_audiences_s));
+
+		if (hba->yb_jwt_issuers_s)
+			options[noptions++] =
+				CStringGetTextDatum(psprintf("jwt_issuers=%s",
+											 hba->yb_jwt_issuers_s));
+
+		if (hba->yb_jwt_matching_claim_key)
+			options[noptions++] =
+				CStringGetTextDatum(psprintf("jwt_matching_claim_key=%s",
+											 hba->yb_jwt_matching_claim_key));
 	}
 
 	/* If you add more options, consider increasing MAX_HBA_OPTIONS. */
@@ -3167,7 +3286,61 @@ load_ident(void)
 	return true;
 }
 
+static inline bool
+yb_set_hba_tserver_key(hbaPort *port)
+{
+	if (!IsYugaByteEnabled())
+		return false;
 
+	/* Not supported in auth passthrough */
+	if (port->yb_is_auth_passthrough_req)
+		return false;
+
+	/* Supported only in unix domain socket */
+	if (!IS_AF_UNIX(port->raddr.addr.ss_family))
+		return false;
+
+	/*
+	 * Check that client connections are allowed to set yb-tserver-key
+	 * as the authentication method via the startup packet.
+	 */
+	char *is_allowed = getenv("YB_ALLOW_CLIENT_SET_TSERVER_KEY_AUTH");
+	if (is_allowed == NULL || strcmp(is_allowed, "1") != 0)
+		return false;
+
+	ListCell *gucopts;
+
+	/*
+	 * Parsing and setting startup parameter happen after authentication.
+	 * Therefore, the startup parameter "yb_use_tserver_key_auth" is not yet
+	 * set, we need to parse the startup parameter list.
+	 */
+	gucopts = list_head(port->guc_options);
+	while (gucopts)
+	{
+		char *name;
+		char *value;
+
+		name = lfirst(gucopts);
+		gucopts = lnext(gucopts);
+
+		value = lfirst(gucopts);
+		gucopts = lnext(gucopts);
+
+		if (strcasecmp(name, "yb_use_tserver_key_auth") == 0)
+		{
+			bool result;
+			if (!parse_bool(value, &result))
+				ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								errmsg("parameter \"%s\" requires a Boolean "
+									   "value", name)));
+
+			return result;
+		}
+	}
+
+	return false;
+}
 
 /*
  *	Determine what authentication method should be used when accessing database
@@ -3180,5 +3353,13 @@ load_ident(void)
 void
 hba_getauthmethod(hbaPort *port)
 {
+	if (yb_set_hba_tserver_key(port))
+	{
+		port->yb_is_tserver_auth_method = true;
+		port->hba = palloc0(sizeof(HbaLine));
+		*port->hba = (HbaLine){.auth_method = uaYbTserverKey};
+		return;
+	}
+
 	check_hba(port);
 }

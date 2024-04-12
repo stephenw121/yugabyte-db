@@ -29,14 +29,11 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_UTIL_COW_OBJECT_H
-#define YB_UTIL_COW_OBJECT_H
+#pragma once
 
 #include <fcntl.h>
 
 #include <algorithm>
-
-#include <glog/logging.h>
 
 #include "yb/gutil/macros.h"
 
@@ -129,6 +126,14 @@ class CowObject {
     DCHECK(lock_.HasReaders() || lock_.HasWriteLock());
     return is_dirty_;
   }
+
+  // Return true if the current thread holds the write lock.
+  //
+  // In DEBUG mode this is accurate -- we track the current holder's tid.
+  // In non-DEBUG mode, this may sometimes return true even if another thread
+  // is in fact the holder.
+  // Thus, this is only really useful in the context of a DCHECK assertion.
+  bool HasWriteLock() const { return lock_.HasWriteLock(); }
 
   void WriteLockThreadChanged() {
     lock_.WriteLockThreadChanged();
@@ -302,5 +307,3 @@ class CowWriteLock {
 };
 
 } // namespace yb
-
-#endif /* YB_UTIL_COW_OBJECT_H */

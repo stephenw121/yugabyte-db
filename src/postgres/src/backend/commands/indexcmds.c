@@ -15,6 +15,8 @@
 
 #include "postgres.h"
 
+#include <inttypes.h>
+
 #include "access/amapi.h"
 #include "access/htup_details.h"
 #include "access/reloptions.h"
@@ -67,8 +69,11 @@
 
 /* YB includes. */
 #include "catalog/pg_database.h"
+#include "commands/progress.h"
 #include "commands/tablegroup.h"
 #include "pg_yb_utils.h"
+#include "pgstat.h"
+#include "utils/yb_inheritscache.h"
 
 /* non-export function prototypes */
 static void CheckPredicate(Expr *predicate);
@@ -91,6 +96,9 @@ static List *ChooseIndexColumnNames(List *indexElems);
 static void RangeVarCallbackForReindexIndex(const RangeVar *relation,
 								Oid relId, Oid oldRelId, void *arg);
 static void ReindexPartitionedIndex(Relation parentIdx);
+
+/* YB function declarations. */
+static void YbWaitForBackendsCatalogVersion();
 
 /*
  * CheckIndexCompatible
@@ -380,6 +388,27 @@ DefineIndex(Oid relationId,
 	root_save_nestlevel = NewGUCNestLevel();
 
 	/*
+	 * Start progress report.  If we're building a partition, this was already
+	 * done.
+	 */
+	if (!OidIsValid(parentIndexId))
+	{
+		pgstat_progress_start_command(PROGRESS_COMMAND_CREATE_INDEX,
+									  relationId);
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_COMMAND,
+									 stmt->concurrent &&
+									 IsYBRelationById(relationId) ?
+									 PROGRESS_CREATEIDX_COMMAND_CREATE_CONCURRENTLY :
+									 PROGRESS_CREATEIDX_COMMAND_CREATE);
+	}
+
+	/*
+	 * No index OID to report yet
+	 */
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_INDEX_OID,
+								 InvalidOid);
+
+	/*
 	 * count key attributes in index
 	 */
 	numberOfKeyAttributes = list_length(stmt->indexParams);
@@ -411,6 +440,32 @@ DefineIndex(Oid relationId,
 	 * its metadata. Stronger lock will be taken later.
 	 */
 	rel = heap_open(relationId, AccessShareLock);
+
+	if (IsYugaByteEnabled())
+	{
+		const int	cols[] = {
+			PROGRESS_CREATEIDX_PHASE,
+			PROGRESS_CREATEIDX_TUPLES_TOTAL,
+			PROGRESS_CREATEIDX_TUPLES_DONE,
+		};
+		int64	values[3];
+		values[0] = YB_PROGRESS_CREATEIDX_INITIALIZING;
+		if (IsYBRelation(rel))
+		{
+			values[1] = rel->rd_rel->reltuples;
+			values[2] = 0;
+		}
+		else
+		{
+			/*
+			 * For temp tables, we set tuples_total and tuples_done to an
+			 * invalid value (-1) because we do not compute them.
+			 */
+			values[1] = -1;
+			values[2] = -1;
+		}
+		pgstat_progress_update_multi_param(3, cols, values);
+	}
 
 	/*
 	 * Switch to the table owner's userid, so that any index functions are run
@@ -613,6 +668,19 @@ DefineIndex(Oid relationId,
 		}
 	}
 
+	if (IsYugaByteEnabled() &&
+		stmt->tableSpace &&
+		rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+	{
+		/*
+		 * Disable setting tablespaces for temporary indexes in Yugabyte
+		 * clusters.
+		 */
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("cannot set tablespace for temporary index")));
+	}
+
 	/*
 	 * Select tablespace to use.  If not specified, use default tablespace
 	 * (which may in turn default to database's default).
@@ -664,28 +732,33 @@ DefineIndex(Oid relationId,
 						   get_tablespace_name(tablespaceId));
 	}
 
-	/* Use tablegroup of the indexed table, if any. */
-	Oid tablegroupId = YbTablegroupCatalogExists && IsYBRelation(rel) ?
-		YbGetTableProperties(rel)->tablegroup_oid :
-		InvalidOid;
-
-	if (OidIsValid(tablegroupId) && stmt->split_options)
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-				 errmsg("Cannot use TABLEGROUP with SPLIT.")));
-	}
-
-
 	/*
 	 * Get whether the indexed table is colocated
 	 * (either via database or a tablegroup).
+	 * If the indexed table is colocated, then this index is colocated as well.
 	 */
 	bool is_colocated =
 		IsYBRelation(rel) &&
 		!IsBootstrapProcessingMode() &&
 		!YbIsConnectedToTemplateDb() &&
 		YbGetTableProperties(rel)->is_colocated;
+
+	/* Use tablegroup of the indexed table, if any. */
+	Oid tablegroupId = YbTablegroupCatalogExists && IsYBRelation(rel) ?
+		YbGetTableProperties(rel)->tablegroup_oid :
+		InvalidOid;
+
+	if (stmt->split_options)
+	{
+		if (MyDatabaseColocated && is_colocated)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("cannot create colocated index with split option")));
+		else if (OidIsValid(tablegroupId))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("cannot use TABLEGROUP with SPLIT")));
+	}
 
 	Oid colocation_id = YbGetColocationIdFromRelOptions(stmt->options);
 
@@ -704,10 +777,13 @@ DefineIndex(Oid relationId,
 				errmsg("TABLESPACE is not supported for indexes on colocated tables.")));
 
 	/*
+	 * Skip the check in a colocated database because any user can create tables
+	 * in an implicit tablegroup.
 	 * Check permissions for tablegroup. To create an index within a tablegroup, a user must
 	 * either be a superuser, the owner of the tablegroup, or have create perms on it.
 	 */
-	if (OidIsValid(tablegroupId) && !pg_tablegroup_ownercheck(tablegroupId, GetUserId()))
+	if (!MyDatabaseColocated &&
+		OidIsValid(tablegroupId) && !pg_tablegroup_ownercheck(tablegroupId, GetUserId()))
 	{
 		AclResult  aclresult;
 
@@ -1111,7 +1187,7 @@ DefineIndex(Oid relationId,
 					 flags, constr_flags,
 					 allowSystemTableMods, !check_rights,
 					 &createdConstraintId, stmt->split_options,
-					 !concurrent, tablegroupId, colocation_id);
+					 !concurrent, is_colocated, tablegroupId, colocation_id);
 
 	ObjectAddressSet(address, RelationRelationId, indexRelationId);
 
@@ -1127,6 +1203,11 @@ DefineIndex(Oid relationId,
 		SetUserIdAndSecContext(root_save_userid, root_save_sec_context);
 
 		heap_close(rel, NoLock);
+
+		/* If this is the top-level index, we're done */
+		if (!OidIsValid(parentIndexId))
+			pgstat_progress_end_command();
+
 		return address;
 	}
 
@@ -1164,6 +1245,9 @@ DefineIndex(Oid relationId,
 			bool		invalidate_parent = false;
 			TupleDesc	parentDesc;
 			Oid		   *opfamOids;
+
+			pgstat_progress_update_param(PROGRESS_CREATEIDX_PARTITIONS_TOTAL,
+										 nparts);
 
 			memcpy(part_oids, partdesc->oids, sizeof(Oid) * nparts);
 
@@ -1204,10 +1288,10 @@ DefineIndex(Oid relationId,
 				child_save_nestlevel = NewGUCNestLevel();
 
 				childidxs = RelationGetIndexList(childrel);
-				attmap =
-					convert_tuples_by_name_map(RelationGetDescr(childrel),
-											   parentDesc,
-											   gettext_noop("could not convert row type"));
+				attmap = convert_tuples_by_name_map(
+					RelationGetDescr(childrel), parentDesc,
+					gettext_noop("could not convert row type"),
+					false /* yb_ignore_type_mismatch */);
 				maplen = parentDesc->natts;
 
 
@@ -1337,6 +1421,8 @@ DefineIndex(Oid relationId,
 										   child_save_sec_context);
 				}
 
+				pgstat_progress_update_param(PROGRESS_CREATEIDX_PARTITIONS_DONE,
+											 i + 1);
 				pfree(attmap);
 			}
 
@@ -1373,6 +1459,8 @@ DefineIndex(Oid relationId,
 		 */
 		AtEOXact_GUC(false, root_save_nestlevel);
 		SetUserIdAndSecContext(root_save_userid, root_save_sec_context);
+		if (!OidIsValid(parentIndexId))
+			pgstat_progress_end_command();
 		return address;
 	}
 
@@ -1383,6 +1471,11 @@ DefineIndex(Oid relationId,
 	{
 		/* Close the heap and we're done, in the non-concurrent case */
 		heap_close(rel, NoLock);
+
+		/* If this is the top-level index, we're done. */
+		if (!OidIsValid(parentIndexId))
+			pgstat_progress_end_command();
+
 		return address;
 	}
 
@@ -1421,15 +1514,30 @@ DefineIndex(Oid relationId,
 	 * change.
 	 * TODO(jason): handle nested CREATE INDEX (this assumes we're at nest
 	 */
-	YBDecrementDdlNestingLevel(true /* is_catalog_version_increment */,
-	                           false /* is_breaking_catalog_change */);
+	YBDecrementDdlNestingLevel();
 	CommitTransactionCommand();
+
+	/*
+	 * The index is now visible, so we can report the OID.
+	 */
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_INDEX_OID,
+								 indexRelationId);
 
 	/* Delay after committing pg_index update. */
 	pg_usleep(yb_index_state_flags_update_delay * 1000);
+	if (IsYugaByteEnabled() && yb_test_block_index_phase[0] != '\0')
+		YbTestGucBlockWhileStrEqual(&yb_test_block_index_phase,
+									"indisready",
+									"index state change indisready=true");
 
 	StartTransactionCommand();
-	YBIncrementDdlNestingLevel();
+
+	YBIncrementDdlNestingLevel(YB_DDL_MODE_VERSION_INCREMENT);
+
+	/* Wait for all backends to have up-to-date version. */
+	YbWaitForBackendsCatalogVersion();
+
+	YbTestGucFailIfStrEqual(yb_test_fail_index_state_change, "indisready");
 
 	/*
 	 * Update the pg_index row to mark the index as ready for inserts.
@@ -1443,20 +1551,38 @@ DefineIndex(Oid relationId,
 	 * TODO(jason): handle nested CREATE INDEX (this assumes we're at nest
 	 * level 1).
 	 */
-	YBDecrementDdlNestingLevel(true /* is_catalog_version_increment */,
-	                           false /* is_breaking_catalog_change */);
+	YBDecrementDdlNestingLevel();
 	CommitTransactionCommand();
 
 	/* Delay after committing pg_index update. */
 	pg_usleep(yb_index_state_flags_update_delay * 1000);
+	if (IsYugaByteEnabled() && yb_test_block_index_phase[0] != '\0')
+		YbTestGucBlockWhileStrEqual(&yb_test_block_index_phase,
+									"backfill",
+									"concurrent index backfill");
 
 	StartTransactionCommand();
-	YBIncrementDdlNestingLevel();
+	YBIncrementDdlNestingLevel(YB_DDL_MODE_VERSION_INCREMENT);
+
+	/* Wait for all backends to have up-to-date version. */
+	YbWaitForBackendsCatalogVersion();
+
+	if (IsYugaByteEnabled())
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_PHASE,
+									 YB_PROGRESS_CREATEIDX_BACKFILLING);
 
 	/* TODO(jason): handle exclusion constraints, possibly not here. */
 
 	/* Do backfill. */
 	HandleYBStatus(YBCPgBackfillIndex(databaseId, indexRelationId));
+
+	YbTestGucFailIfStrEqual(yb_test_fail_index_state_change, "postbackfill");
+
+	if (IsYugaByteEnabled() && yb_test_block_index_phase[0] != '\0')
+		YbTestGucBlockWhileStrEqual(&yb_test_block_index_phase,
+									"postbackfill",
+									"operations after concurrent "
+									"index backfill");
 
 	/*
 	 * Index can now be marked valid -- update its pg_index entry
@@ -1477,6 +1603,8 @@ DefineIndex(Oid relationId,
 	 * Last thing to do is release the session-level lock on the parent table.
 	 */
 	UnlockRelationIdForSession(&heaprelid, ShareUpdateExclusiveLock);
+
+	pgstat_progress_end_command();
 
 	return address;
 }
@@ -1653,60 +1781,32 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 		Oid			atttype;
 		Oid			attcollation;
 
-		if (IsYugaByteEnabled())
+		SortByDir   yb_ordering = attribute->ordering;
+
+		if (use_yb_ordering)
 		{
-			if (use_yb_ordering)
+			yb_ordering =
+				YbSortOrdering(attribute->ordering, is_colocated,
+							   OidIsValid(tablegroupId) /* is_tablegroup */,
+							   (attn == 0) /* is_first_key */);
+
+			if (yb_ordering == SORTBY_DESC || yb_ordering == SORTBY_ASC)
 			{
-				switch (attribute->ordering)
-				{
-					case SORTBY_ASC:
-					case SORTBY_DESC:
-						range_index = true;
-						break;
-					case SORTBY_DEFAULT:
-						/*
-						 * In YB mode, first attribute defaults to HASH and
-						 * other attributes default to ASC.  However, for
-						 * colocated tables, the first attribute defaults to
-						 * ASC.
-						 */
-						if (attn > 0 || is_colocated || tablegroupId != InvalidOid)
-						{
-							range_index = true;
-							break;
-						}
-						switch_fallthrough();
-					case SORTBY_HASH:
-						if (range_index)
-							ereport(ERROR,
-									(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-									errmsg("hash column not allowed after an ASC/DESC column")));
-						else if (tablegroupId != InvalidOid)
-							ereport(ERROR,
-									(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-									 errmsg("cannot create a hash partitioned"
-									 		" index in a TABLEGROUP")));
-						else if (is_colocated)
-							ereport(ERROR,
-									(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-									 errmsg("cannot colocate hash partitioned index")));
-						break;
-					default:
-						ereport(ERROR,
-								(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-								errmsg("unsupported column sort order")));
-						break;
-				}
+				range_index = true;
 			}
-			else
+			else if (yb_ordering == SORTBY_HASH)
 			{
-				if (attribute->ordering == SORTBY_HASH)
-				{
-						ereport(ERROR,
-								(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-								errmsg("unsupported column sort order")));
-				}
+				if (range_index)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+							 errmsg("hash column not allowed after an ASC/DESC column")));
 			}
+		}
+		else if (attribute->ordering == SORTBY_HASH)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("unsupported column sort order")));
 		}
 
 		/*
@@ -1951,18 +2051,8 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 			/* default ordering is ASC */
 			if (attribute->ordering == SORTBY_DESC)
 				colOptionP[attn] |= INDOPTION_DESC;
-			if (IsYugaByteEnabled() &&
-				attribute->ordering == SORTBY_HASH)
-				colOptionP[attn] |= INDOPTION_HASH;
 
-			/*
-			 * In Yugabyte, use HASH as the default for the first column of
-			 * non-colocated tables
-			 */
-			if (use_yb_ordering &&
-				attn == 0 &&
-				attribute->ordering == SORTBY_DEFAULT &&
-				!is_colocated && tablegroupId == InvalidOid)
+			if (yb_ordering == SORTBY_HASH)
 				colOptionP[attn] |= INDOPTION_HASH;
 
 			/* default null ordering is LAST for ASC, FIRST for DESC */
@@ -2525,7 +2615,9 @@ ReindexIndex(RangeVar *indexRelation, int options)
 	persistence = irel->rd_rel->relpersistence;
 	index_close(irel, NoLock);
 
-	reindex_index(indOid, false, persistence, options);
+	reindex_index(indOid, false, persistence, options,
+				  false /* is_yb_table_rewrite */,
+				  true /* yb_copy_split_options */);
 }
 
 /*
@@ -2604,7 +2696,9 @@ ReindexTable(RangeVar *relation, int options)
 	if (!reindex_relation(heapOid,
 						  REINDEX_REL_PROCESS_TOAST |
 						  REINDEX_REL_CHECK_CONSTRAINTS,
-						  options))
+						  options,
+						  false /* is_yb_table_rewrite */,
+						  true /* yb_copy_split_options */))
 		ereport(NOTICE,
 				(errmsg("table \"%s\" has no indexes",
 						relation->relname)));
@@ -2775,7 +2869,9 @@ ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind,
 		if (reindex_relation(relid,
 							 REINDEX_REL_PROCESS_TOAST |
 							 REINDEX_REL_CHECK_CONSTRAINTS,
-							 options))
+							 options,
+							 false /* is_yb_table_rewrite */,
+							 true /* yb_copy_split_options */))
 
 			if (options & REINDEXOPT_VERBOSE)
 				ereport(INFO,
@@ -2909,6 +3005,18 @@ IndexSetParentIndex(Relation partitionIdx, Oid parentOid)
 
 	if (fix_dependencies)
 	{
+		if (IsYugaByteEnabled())
+		{
+			/*
+			* YB Note: If setting index parent, invalidate the entry for the
+			* parent table in the pg_inherits cache as the parent now has a new
+			* child. If clearing the entry for the child, then invalidate the
+			* entry in the cache pertaining to the child and its old parent.
+			*/
+			YbPgInheritsCacheInvalidate(
+				OidIsValid(parentOid) ? parentOid : partRelid);
+		}
+
 		ObjectAddress partIdx;
 
 		/*
@@ -2942,5 +3050,82 @@ IndexSetParentIndex(Relation partitionIdx, Oid parentOid)
 
 		/* make our updates visible */
 		CommandCounterIncrement();
+	}
+}
+
+static void
+YbWaitForBackendsCatalogVersion()
+{
+	if (yb_disable_wait_for_backends_catalog_version)
+		return;
+
+	int num_lagging_backends = -1;
+	int retries_left = 10;
+	const TimestampTz start = GetCurrentTimestamp();
+	while (num_lagging_backends != 0)
+	{
+		if (yb_wait_for_backends_catalog_version_timeout > 0 &&
+			TimestampDifferenceExceeds(start,
+									   GetCurrentTimestamp(),
+									   yb_wait_for_backends_catalog_version_timeout))
+		{
+			if (num_lagging_backends > 0)
+				ereport(ERROR,
+						(errmsg("timed out waiting for postgres backends to catch"
+								" up"),
+						 errdetail("%d backends on database %u are still behind"
+								   " catalog version %" PRIu64 ".",
+								   num_lagging_backends,
+								   MyDatabaseId,
+								   YbGetCatalogCacheVersion()),
+						 errhint("Run the following query on all tservers to find"
+								 " the lagging backends: SELECT * FROM"
+								 " pg_stat_activity WHERE catalog_version < %"
+								 PRIu64 " AND datid = %u;",
+								 YbGetCatalogCacheVersion(),
+								 MyDatabaseId)));
+			else
+			{
+				Assert(num_lagging_backends == -1);
+				ereport(ERROR,
+						(errmsg("timed out waiting for postgres backends to catch"
+								" up"),
+						 errdetail("Failed to determine how many backends on"
+								   " database %u are still behind"
+								   " catalog version %" PRIu64 ".",
+								   MyDatabaseId,
+								   YbGetCatalogCacheVersion())));
+			}
+		}
+
+		YBCStatus s = YBCPgWaitForBackendsCatalogVersion(MyDatabaseId,
+														 YbGetCatalogCacheVersion(),
+														 &num_lagging_backends);
+
+		if (!s)		/* ok */
+			continue;
+		if (YBCStatusIsTryAgain(s))
+		{
+			YBCFreeStatus(s);
+			continue;
+		}
+		/*
+		 * TODO(#5030): there is a bug where master commits a catalog
+		 * version bump and the following read doesn't pick it up.  This is
+		 * short-lived, so there only needs to be a few retries.
+		 */
+		const char *msg = YBCStatusMessageBegin(s);
+		if (strstr(msg, "Requested catalog version is too high"))
+		{
+			elog((retries_left > 3 ? DEBUG1 : NOTICE),
+				 "Retrying wait for backends catalog version: %s",
+				 msg);
+			if (retries_left-- > 0)
+			{
+				YBCFreeStatus(s);
+				continue;
+			}
+		}
+		HandleYBStatus(s);
 	}
 }

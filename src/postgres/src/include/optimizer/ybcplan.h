@@ -20,8 +20,7 @@
  *--------------------------------------------------------------------------------------------------
  */
 
-#ifndef YBCPLAN_H
-#define YBCPLAN_H
+#pragma once
 
 #include "postgres.h"
 #include "nodes/plannodes.h"
@@ -31,10 +30,17 @@
 
 bool YBCIsSingleRowModify(PlannedStmt *pstmt);
 
-bool YBCIsSingleRowUpdateOrDelete(ModifyTable *modifyTable);
+bool YbCanSkipFetchingTargetTupleForModifyTable(ModifyTable *modifyTable);
 
 bool YBCAllPrimaryKeysProvided(Relation rel, Bitmapset *attrs);
 
-#endif // YBCPLAN_H
+bool is_index_only_refs(List *colrefs, IndexOptInfo *indexinfo, bool bitmapindex);
 
-
+void extract_pushdown_clauses(List *restrictinfo_list,
+							  IndexOptInfo *indexinfo,
+							  bool is_bitmap_index_scan,
+							  List **local_quals,
+							  List **rel_remote_quals,
+							  List **rel_colrefs,
+							  List **idx_remote_quals,
+							  List **idx_colrefs);

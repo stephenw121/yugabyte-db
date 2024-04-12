@@ -24,7 +24,7 @@ import org.slf4j.LoggerFactory;
 import org.yb.client.TestUtils;
 import org.yb.minicluster.MiniYBClusterBuilder;
 import org.yb.minicluster.MiniYBDaemon;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 import java.sql.Connection;
 import java.sql.ResultSet;
@@ -35,7 +35,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-@RunWith(value = YBTestRunnerNonTsanOnly.class)
+@RunWith(value = YBTestRunner.class)
 public class TestLoadBalance extends BasePgSQLTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestPgEncryption.class);
 
@@ -51,6 +51,33 @@ public class TestLoadBalance extends BasePgSQLTest {
     super.customizeMiniClusterBuilder(builder);
     builder.numTservers(7);
     builder.replicationFactor(3);
+  }
+
+  private static int parseYsqlPort(String[] cmds) {
+    for (String cmd : cmds) {
+      if (cmd.contains("pgsql_proxy_bind_address")) {
+        int idx = cmd.indexOf(":");
+        return Integer.parseInt(cmd.substring(idx + 1));
+      }
+    }
+
+    return 5433;
+  }
+
+  private static int parseYsqlConnMgrPort(String[] cmds) {
+    for (String cmd : cmds) {
+      if (cmd.contains("ysql_conn_mgr_port")) {
+        int idx = cmd.indexOf("=");
+        return Integer.parseInt(cmd.substring(idx + 1));
+      }
+    }
+
+    return 5433;
+  }
+
+  private int getSmartDriverPortFromTserverFlags(String[] cmds) {
+    return isTestRunningWithConnectionManager() == true ?
+       parseYsqlConnMgrPort(cmds) : parseYsqlPort(cmds);
   }
 
   @Test
@@ -78,15 +105,8 @@ public class TestLoadBalance extends BasePgSQLTest {
       AssertionWrappers.assertNotNull(portInMap);
       HostAndPort hp = HostAndPort.fromParts(host, portInMap);
       MiniYBDaemon daemon = hostPortsDaemonMap.get(hp);
-      String[] cmds = daemon.getCommandLine();
-      int pg_port = 5433;
-      for (String cmd : cmds) {
-        if (cmd.contains("pgsql_proxy_bind_address")) {
-          int idx = cmd.indexOf(":");
-          pg_port = Integer.parseInt(cmd.substring(idx+1));
-          break;
-        }
-      }
+      int pg_port = getSmartDriverPortFromTserverFlags(daemon.getCommandLine());
+
       AssertionWrappers.assertEquals("port should be equal", pg_port, port);
       AssertionWrappers.assertEquals("primary", node_type);
       AssertionWrappers.assertEquals("connections has been hardcoded to 0", 0, connections);

@@ -22,7 +22,7 @@
 #include "yb/common/entity_ids.h"
 #include "yb/common/pg_system_attr.h"
 
-#include "yb/util/flag_tags.h"
+#include "yb/util/flags.h"
 #include "yb/util/status_format.h"
 #include "yb/util/status_log.h"
 #include "yb/util/tsan_util.h"
@@ -33,6 +33,7 @@ DEFINE_test_flag(int32, user_ddl_operation_timeout_sec, 0,
                  "Adjusts the timeout for a DDL operation from the YBClient default, if non-zero.");
 
 DECLARE_int32(max_num_tablets_for_table);
+DECLARE_int32(yb_client_admin_operation_timeout_sec);
 
 namespace yb {
 namespace pggate {
@@ -41,7 +42,6 @@ using namespace std::literals;  // NOLINT
 
 // TODO(neil) This should be derived from a GFLAGS.
 static MonoDelta kDdlTimeout = 60s * kTimeMultiplier;
-static MonoDelta kCreateDatabaseTimeout = 1s * RegularBuildVsDebugVsSanitizers(60, 150, 180);
 
 namespace {
 
@@ -55,11 +55,12 @@ CoarseTimePoint DdlDeadline() {
 
 // Make a special case for create database because it is a well-known slow operation in YB.
 CoarseTimePoint CreateDatabaseDeadline() {
-  auto timeout = MonoDelta::FromSeconds(FLAGS_TEST_user_ddl_operation_timeout_sec);
-  if (timeout == MonoDelta::kZero) {
-    timeout = kCreateDatabaseTimeout;
+  int32 timeout = FLAGS_TEST_user_ddl_operation_timeout_sec;
+  if (timeout == 0) {
+    timeout = FLAGS_yb_client_admin_operation_timeout_sec *
+              RegularBuildVsDebugVsSanitizers(1, 2, 2);
   }
-  return CoarseMonoClock::now() + timeout;
+  return CoarseMonoClock::now() + MonoDelta::FromSeconds(timeout);
 }
 
 } // namespace
@@ -105,8 +106,8 @@ Status PgDropDatabase::Exec() {
 }
 
 PgAlterDatabase::PgAlterDatabase(PgSession::ScopedRefPtr pg_session,
-                               const char *database_name,
-                               PgOid database_oid)
+                                 const char *database_name,
+                                 PgOid database_oid)
     : PgDdl(pg_session) {
   req_.set_database_name(database_name);
   req_.set_database_oid(database_oid);
@@ -176,7 +177,9 @@ PgCreateTable::PgCreateTable(PgSession::ScopedRefPtr pg_session,
                              const ColocationId colocation_id,
                              const PgObjectId& tablespace_oid,
                              bool is_matview,
-                             const PgObjectId& matview_pg_table_oid)
+                             const PgObjectId& pg_table_oid,
+                             const PgObjectId& old_relfilenode_oid,
+                             bool is_truncate)
     : PgDdl(pg_session) {
   table_id.ToPB(req_.mutable_table_id());
   req_.set_database_name(database_name);
@@ -194,7 +197,9 @@ PgCreateTable::PgCreateTable(PgSession::ScopedRefPtr pg_session,
   }
   tablespace_oid.ToPB(req_.mutable_tablespace_oid());
   req_.set_is_matview(is_matview);
-  matview_pg_table_oid.ToPB(req_.mutable_matview_pg_table_oid());
+  pg_table_oid.ToPB(req_.mutable_pg_table_oid());
+  old_relfilenode_oid.ToPB(req_.mutable_old_relfilenode_oid());
+  req_.set_is_truncate(is_truncate);
 
   // Add internal primary key column to a Postgres table without a user-specified primary key.
   if (add_primary_key) {
@@ -221,7 +226,7 @@ Status PgCreateTable::AddColumnImpl(const char *attr_name,
   column.set_attr_ybtype(attr_ybtype);
   column.set_is_hash(is_hash);
   column.set_is_range(is_range);
-  column.set_sorting_type(sorting_type);
+  column.set_sorting_type(to_underlying(sorting_type));
   column.set_attr_pgoid(pg_type_oid);
   return Status::OK();
 }
@@ -318,8 +323,9 @@ Status PgTruncateTable::Exec() {
 
 PgDropIndex::PgDropIndex(PgSession::ScopedRefPtr pg_session,
                          const PgObjectId& index_id,
-                         bool if_exist)
-    : PgDropTable(pg_session, index_id, if_exist) {
+                         bool if_exist,
+                         bool ddl_rollback_enabled)
+    : PgDropTable(pg_session, index_id, if_exist), ddl_rollback_enabled_(ddl_rollback_enabled) {
 }
 
 PgDropIndex::~PgDropIndex() {
@@ -333,7 +339,8 @@ Status PgDropIndex::Exec() {
     PgObjectId indexed_table_id(indexed_table_name.table_id());
 
     pg_session_->InvalidateTableCache(table_id_, InvalidateOnPgClient::kFalse);
-    pg_session_->InvalidateTableCache(indexed_table_id, InvalidateOnPgClient::kFalse);
+    pg_session_->InvalidateTableCache(indexed_table_id,
+        ddl_rollback_enabled_ ? InvalidateOnPgClient::kTrue : InvalidateOnPgClient::kFalse);
     return Status::OK();
   }
   return s;
@@ -351,12 +358,17 @@ PgAlterTable::PgAlterTable(PgSession::ScopedRefPtr pg_session,
 
 Status PgAlterTable::AddColumn(const char *name,
                                const YBCPgTypeEntity *attr_type,
-                               int order) {
+                               int order,
+                               YBCPgExpr missing_value) {
   auto& col = *req_.mutable_add_columns()->Add();
   col.set_attr_name(name);
   col.set_attr_ybtype(attr_type->yb_type);
   col.set_attr_num(order);
   col.set_attr_pgoid(attr_type->type_oid);
+  if (missing_value) {
+    auto value = VERIFY_RESULT(missing_value->Eval());
+    value->ToGoogleProtobuf(col.mutable_attr_missing_val());
+  }
   return Status::OK();
 }
 
@@ -372,6 +384,22 @@ Status PgAlterTable::DropColumn(const char *name) {
   return Status::OK();
 }
 
+Status PgAlterTable::SetReplicaIdentity(const char identity_type) {
+  auto replica_identity_pb = std::make_unique<tserver::PgReplicaIdentityPB>();
+  tserver::PgReplicaIdentityType replica_identity_type;
+  switch (identity_type) {
+    case 'd': replica_identity_type = tserver::DEFAULT; break;
+    case 'n': replica_identity_type = tserver::NOTHING; break;
+    case 'f': replica_identity_type = tserver::FULL; break;
+    case 'c': replica_identity_type = tserver::CHANGE; break;
+    default:
+      RSTATUS_DCHECK(false, InvalidArgument, "Invalid Replica Identity Type");
+  }
+  replica_identity_pb->set_replica_identity(replica_identity_type);
+  req_.set_allocated_replica_identity(replica_identity_pb.release());
+  return Status::OK();
+}
+
 Status PgAlterTable::RenameTable(const char *db_name, const char *newname) {
   auto& rename = *req_.mutable_rename_table();
   rename.set_database_name(db_name);
@@ -384,6 +412,11 @@ Status PgAlterTable::IncrementSchemaVersion() {
   return Status::OK();
 }
 
+Status PgAlterTable::SetTableId(const PgObjectId& table_id) {
+  table_id.ToPB(req_.mutable_table_id());
+  return Status::OK();
+}
+
 Status PgAlterTable::Exec() {
   RETURN_NOT_OK(pg_session_->pg_client().AlterTable(&req_, DdlDeadline()));
   pg_session_->InvalidateTableCache(
@@ -391,7 +424,92 @@ Status PgAlterTable::Exec() {
   return Status::OK();
 }
 
+void PgAlterTable::InvalidateTableCacheEntry() {
+  pg_session_->InvalidateTableCache(
+      PgObjectId::FromPB(req_.table_id()), InvalidateOnPgClient::kTrue);
+}
+
 PgAlterTable::~PgAlterTable() {
+}
+
+//--------------------------------------------------------------------------------------------------
+// PgDropSequence
+//--------------------------------------------------------------------------------------------------
+
+PgDropSequence::PgDropSequence(PgSession::ScopedRefPtr pg_session,
+                               PgOid database_oid,
+                               PgOid sequence_oid)
+  : PgDdl(std::move(pg_session)),
+    database_oid_(database_oid),
+    sequence_oid_(sequence_oid) {
+}
+
+PgDropSequence::~PgDropSequence() {
+}
+
+Status PgDropSequence::Exec() {
+  return pg_session_->pg_client().DeleteSequenceTuple(database_oid_, sequence_oid_);
+}
+
+PgDropDBSequences::PgDropDBSequences(PgSession::ScopedRefPtr pg_session,
+                                     PgOid database_oid)
+  : PgDdl(std::move(pg_session)),
+    database_oid_(database_oid) {
+}
+
+PgDropDBSequences::~PgDropDBSequences() {
+}
+
+Status PgDropDBSequences::Exec() {
+  return pg_session_->pg_client().DeleteDBSequences(database_oid_);
+}
+
+// PgCreateReplicationSlot
+//--------------------------------------------------------------------------------------------------
+
+PgCreateReplicationSlot::PgCreateReplicationSlot(PgSession::ScopedRefPtr pg_session,
+                                                 const char *slot_name,
+                                                 PgOid database_oid,
+                                                 YBCPgReplicationSlotSnapshotAction snapshot_action)
+    : PgDdl(pg_session) {
+  req_.set_database_oid(database_oid);
+  req_.set_replication_slot_name(slot_name);
+
+  switch (snapshot_action) {
+    case YB_REPLICATION_SLOT_NOEXPORT_SNAPSHOT:
+      req_.set_snapshot_action(
+          tserver::PgReplicationSlotSnapshotActionPB::REPLICATION_SLOT_NOEXPORT_SNAPSHOT);
+      break;
+    case YB_REPLICATION_SLOT_USE_SNAPSHOT:
+      req_.set_snapshot_action(
+          tserver::PgReplicationSlotSnapshotActionPB::REPLICATION_SLOT_USE_SNAPSHOT);
+      break;
+    default:
+      DCHECK(false) << "Unknown snapshot_action " << snapshot_action;
+  }
+}
+
+Result<tserver::PgCreateReplicationSlotResponsePB> PgCreateReplicationSlot::Exec() {
+  return pg_session_->pg_client().CreateReplicationSlot(&req_, DdlDeadline());
+}
+
+PgCreateReplicationSlot::~PgCreateReplicationSlot() {
+}
+
+// PgDropReplicationSlot
+//--------------------------------------------------------------------------------------------------
+
+PgDropReplicationSlot::PgDropReplicationSlot(PgSession::ScopedRefPtr pg_session,
+                                             const char *slot_name)
+    : PgDdl(pg_session) {
+  req_.set_replication_slot_name(slot_name);
+}
+
+Status PgDropReplicationSlot::Exec() {
+  return pg_session_->pg_client().DropReplicationSlot(&req_, DdlDeadline());
+}
+
+PgDropReplicationSlot::~PgDropReplicationSlot() {
 }
 
 }  // namespace pggate

@@ -33,11 +33,9 @@
 
 #include <memory>
 
-#include <gflags/gflags.h>
-#include <glog/logging.h>
-
-#include "yb/common/partition.h"
-#include "yb/common/ql_rowblock.h"
+#include "yb/dockv/partition.h"
+#include "yb/qlexpr/ql_rowblock.h"
+#include "yb/common/schema_pbutil.h"
 #include "yb/common/schema.h"
 #include "yb/common/wire_protocol.h"
 
@@ -49,7 +47,7 @@
 #include "yb/rpc/secure_stream.h"
 
 #include "yb/consensus/metadata.pb.h"
-#include "yb/server/secure.h"
+#include "yb/rpc/secure.h"
 #include "yb/server/server_base.proxy.h"
 
 #include "yb/tablet/tablet.pb.h"
@@ -69,16 +67,19 @@ using std::ostringstream;
 using std::shared_ptr;
 using std::string;
 using std::vector;
-using yb::HostPort;
 using yb::consensus::ConsensusServiceProxy;
 using yb::consensus::RaftConfigPB;
 using yb::rpc::Messenger;
 using yb::rpc::MessengerBuilder;
 using yb::rpc::RpcController;
-using yb::server::ServerStatusPB;
 using yb::server::ReloadCertificatesRequestPB;
 using yb::server::ReloadCertificatesResponsePB;
+using yb::server::ServerStatusPB;
 using yb::tablet::TabletStatusPB;
+using yb::tserver::ClearAllMetaCachesOnServerRequestPB;
+using yb::tserver::ClearAllMetaCachesOnServerResponsePB;
+using yb::tserver::ClearUniverseUuidRequestPB;
+using yb::tserver::ClearUniverseUuidResponsePB;
 using yb::tserver::CountIntentsRequestPB;
 using yb::tserver::CountIntentsResponsePB;
 using yb::tserver::DeleteTabletRequestPB;
@@ -91,6 +92,8 @@ using yb::tserver::ListTabletsRequestPB;
 using yb::tserver::ListTabletsResponsePB;
 using yb::tserver::TabletServerAdminServiceProxy;
 using yb::tserver::TabletServerServiceProxy;
+using yb::tserver::ListMasterServersRequestPB;
+using yb::tserver::ListMasterServersResponsePB;
 using yb::consensus::StartRemoteBootstrapRequestPB;
 using yb::consensus::StartRemoteBootstrapResponsePB;
 
@@ -113,22 +116,25 @@ const char* const kCompactTabletOp = "compact_tablet";
 const char* const kCompactAllTabletsOp = "compact_all_tablets";
 const char* const kReloadCertificatesOp = "reload_certificates";
 const char* const kRemoteBootstrapOp = "remote_bootstrap";
+const char* const kListMasterServersOp = "list_master_servers";
+const char* const kClearAllMetaCachesOnServerOp = "clear_server_metacache";
+const char* const kClearUniverseUuidOp = "clear_universe_uuid";
 
-DEFINE_string(server_address, "localhost",
+DEFINE_NON_RUNTIME_string(server_address, "localhost",
               "Address of server to run against");
-DEFINE_int64(timeout_ms, 1000 * 60, "RPC timeout in milliseconds");
+DEFINE_NON_RUNTIME_int64(timeout_ms, 1000 * 60, "RPC timeout in milliseconds");
 
-DEFINE_bool(force, false, "set_flag: If true, allows command to set a flag "
+DEFINE_NON_RUNTIME_bool(force, false, "set_flag: If true, allows command to set a flag "
             "which is not explicitly marked as runtime-settable. Such flag changes may be "
             "simply ignored on the server, or may cause the server to crash.\n"
             "delete_tablet: If true, command will delete the tablet and remove the tablet "
             "from the memory, otherwise tablet metadata will be kept in memory with state "
             "TOMBSTONED.");
 
-DEFINE_string(certs_dir_name, "",
-              "Directory with certificates to use for secure server connection.");
+DEFINE_NON_RUNTIME_string(certs_dir_name, "",
+    "Directory with certificates to use for secure server connection.");
 
-DEFINE_string(client_node_name, "", "Client node name.");
+DEFINE_NON_RUNTIME_string(client_node_name, "", "Client node name.");
 
 PB_ENUM_FORMATTERS(yb::consensus::LeaderLeaseStatus);
 
@@ -162,6 +168,7 @@ namespace yb {
 namespace tools {
 
 typedef ListTabletsResponsePB::StatusAndSchemaPB StatusAndSchemaPB;
+typedef ListMasterServersResponsePB::MasterServerAndTypePB MasterServerAndTypePB;
 
 class TsAdminClient {
  public:
@@ -242,6 +249,14 @@ class TsAdminClient {
   // Performs a manual remote bootstrap onto `target_server` for a given tablet.
   Status RemoteBootstrap(const std::string& target_server, const std::string& tablet_id);
 
+  // List information for all master servers.
+  Status ListMasterServers();
+
+  Status ClearAllMetaCachesOnServer();
+
+  // Clear Universe Uuid.
+  Status ClearUniverseUuid();
+
  private:
   std::string addr_;
   MonoDelta timeout_;
@@ -275,9 +290,9 @@ Status TsAdminClient::Init() {
   auto messenger_builder = MessengerBuilder("ts-cli");
   if (!FLAGS_certs_dir_name.empty()) {
     const std::string& cert_name = FLAGS_client_node_name;
-    secure_context_ = VERIFY_RESULT(server::CreateSecureContext(
-        FLAGS_certs_dir_name, server::UseClientCerts(!cert_name.empty()), cert_name));
-    server::ApplySecureContext(secure_context_.get(), &messenger_builder);
+    secure_context_ = VERIFY_RESULT(rpc::CreateSecureContext(
+        FLAGS_certs_dir_name, rpc::UseClientCerts(!cert_name.empty()), cert_name));
+    rpc::ApplySecureContext(secure_context_.get(), &messenger_builder);
   }
   messenger_ = VERIFY_RESULT(messenger_builder.Build());
 
@@ -464,8 +479,9 @@ Status TsAdminClient::DumpTablet(const std::string& tablet_id) {
     return STATUS(IOError, "Failed to read: ", resp.error().ShortDebugString());
   }
 
-  QLRowBlock row_block(schema);
-  Slice data = VERIFY_RESULT(rpc.GetSidecar(0));
+  qlexpr::QLRowBlock row_block(schema);
+  auto data_buffer = VERIFY_RESULT(rpc.ExtractSidecar(0));
+  auto data = data_buffer.AsSlice();
   if (!data.empty()) {
     RETURN_NOT_OK(row_block.Deserialize(YQL_CLIENT_CQL, &data));
   }
@@ -649,6 +665,57 @@ Status TsAdminClient::RemoteBootstrap(const std::string& source_server,
   return Status::OK();
 }
 
+Status TsAdminClient::ListMasterServers() {
+  CHECK(initted_);
+  std::vector<MasterServerAndTypePB> master_servers;
+  ListMasterServersRequestPB req;
+  ListMasterServersResponsePB resp;
+  RpcController rpc;
+
+  rpc.set_timeout(timeout_);
+  RETURN_NOT_OK(ts_proxy_->ListMasterServers(req, &resp, &rpc));
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+
+  master_servers.assign(resp.master_server_and_type().begin(),
+                          resp.master_server_and_type().end());
+
+  std::cout << "RPC Host/Port\t\tRole" << std::endl;
+  for (const auto &master_server_and_type : master_servers) {
+    std::string leader_string = master_server_and_type.is_leader() ? "Leader" : "Follower";
+    std::cout << master_server_and_type.master_server() << "\t\t" << leader_string << std::endl;
+  }
+
+  return Status::OK();
+}
+
+Status TsAdminClient::ClearAllMetaCachesOnServer() {
+  CHECK(initted_);
+  tserver::ClearAllMetaCachesOnServerRequestPB req;
+  tserver::ClearAllMetaCachesOnServerResponsePB resp;
+  RpcController rpc;
+  rpc.set_timeout(timeout_);
+  RETURN_NOT_OK(ts_proxy_->ClearAllMetaCachesOnServer(req, &resp, &rpc));
+  return Status::OK();
+}
+
+Status TsAdminClient::ClearUniverseUuid() {
+  CHECK(initted_);
+  ClearUniverseUuidRequestPB req;
+  ClearUniverseUuidResponsePB resp;
+  RpcController rpc;
+
+  rpc.set_timeout(timeout_);
+  RETURN_NOT_OK(ts_proxy_->ClearUniverseUuid(req, &resp, &rpc));
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+
+  std::cout << "Universe UUID cleared from Instance Metadata" << std::endl;
+  return Status::OK();
+}
+
 namespace {
 
 void SetUsage(const char* argv0) {
@@ -675,7 +742,9 @@ void SetUsage(const char* argv0) {
       << "  " << kVerifyTabletOp
       << " <tablet_id> <number of indexes> <index list> <start_key> <number of rows>\n"
       << "  " << kReloadCertificatesOp << "\n"
-      << "  " << kRemoteBootstrapOp << " <server address to bootstrap from> <tablet_id>\n";
+      << "  " << kRemoteBootstrapOp << " <server address to bootstrap from> <tablet_id>\n"
+      << "  " << kListMasterServersOp << "\n"
+      << "  " << kClearUniverseUuidOp << "\n";
   google::SetUsageMessage(str.str());
 }
 
@@ -716,16 +785,17 @@ static int TsCliMain(int argc, char** argv) {
       Schema schema;
       RETURN_NOT_OK_PREPEND_FROM_MAIN(SchemaFromPB(status_and_schema.schema(), &schema),
                                       "Unable to deserialize schema from " + addr);
-      PartitionSchema partition_schema;
-      RETURN_NOT_OK_PREPEND_FROM_MAIN(PartitionSchema::FromPB(status_and_schema.partition_schema(),
-                                                              schema, &partition_schema),
-                                      "Unable to deserialize partition schema from " + addr);
+      dockv::PartitionSchema partition_schema;
+      RETURN_NOT_OK_PREPEND_FROM_MAIN(
+          dockv::PartitionSchema::FromPB(
+              status_and_schema.partition_schema(), schema, &partition_schema),
+          "Unable to deserialize partition schema from " + addr);
 
 
       TabletStatusPB ts = status_and_schema.tablet_status();
 
-      Partition partition;
-      Partition::FromPB(ts.partition(), &partition);
+      dockv::Partition partition;
+      dockv::Partition::FromPB(ts.partition(), &partition);
 
       string state = tablet::RaftGroupStatePB_Name(ts.state());
       std::cout << "Tablet id: " << ts.tablet_id() << std::endl;
@@ -885,6 +955,21 @@ static int TsCliMain(int argc, char** argv) {
     string tablet_id = argv[3];
     RETURN_NOT_OK_PREPEND_FROM_MAIN(client.RemoteBootstrap(target_server, tablet_id),
                                     "Unable to run remote bootstrap");
+  } else if (op == kListMasterServersOp) {
+    CHECK_ARGC_OR_RETURN_WITH_USAGE(op, 2);
+
+    RETURN_NOT_OK_PREPEND_FROM_MAIN(client.ListMasterServers(),
+                                    "Unable to list master servers on " + addr);
+  } else if (op == kClearAllMetaCachesOnServerOp) {
+    CHECK_ARGC_OR_RETURN_WITH_USAGE(op, 2);
+    RETURN_NOT_OK_PREPEND_FROM_MAIN(
+        client.ClearAllMetaCachesOnServer(),
+        "Unable to clear the meta-cache on tablet server with address " + addr);
+  } else if (op == kClearUniverseUuidOp) {
+    CHECK_ARGC_OR_RETURN_WITH_USAGE(op, 2);
+
+    RETURN_NOT_OK_PREPEND_FROM_MAIN(client.ClearUniverseUuid(),
+                                    "Unable to clear universe uuid on " + addr);
   } else {
     std::cerr << "Invalid operation: " << op << std::endl;
     google::ShowUsageWithFlagsRestrict(argv[0], __FILE__);

@@ -21,8 +21,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef YB_ROCKSDB_TABLE_BLOCK_BASED_TABLE_READER_H
-#define YB_ROCKSDB_TABLE_BLOCK_BASED_TABLE_READER_H
+#pragma once
 
 #include <stdint.h>
 
@@ -90,13 +89,11 @@ YB_DEFINE_ENUM(BlockType, (kData)(kIndex));
 // hashed components as the key specified in constructor.
 class BloomFilterAwareFileFilter : public TableAwareReadFileFilter {
  public:
-  BloomFilterAwareFileFilter(const ReadOptions& read_options, const Slice& user_key);
+  BloomFilterAwareFileFilter();
 
-  bool Filter(TableReader* reader) const override;
-
- private:
-  const ReadOptions read_options_;
-  const std::string user_key_;
+  bool Filter(
+      const ReadOptions& read_options, Slice user_key, FilterKeyCache* filter_key_cache,
+      TableReader* reader) const override;
 };
 
 // A Table is a sorted map from strings to strings.  Tables are
@@ -139,7 +136,7 @@ class BlockBasedTable : public TableReader {
 
   void SetDataFileReader(std::unique_ptr<RandomAccessFileReader>&& data_file) override;
 
-  bool PrefixMayMatch(const Slice& internal_key);
+  bool PrefixMayMatch(const ReadOptions& read_options, const Slice& internal_key);
 
   // Returns a new iterator over the table contents.
   // The result of NewIterator() is initially invalid (caller must
@@ -190,8 +187,10 @@ class BlockBasedTable : public TableReader {
   //  - nullptr if input_iter is a data index iterator and no new iterators were created.
   //
   // Note: ErrorIterator with error will be returned if GetIndexReader returned an error.
-  InternalIterator* NewIndexIterator(const ReadOptions& read_options,
-                                     BlockIter* input_iter = nullptr);
+  InternalIterator* NewIndexIterator(
+      const ReadOptions& read_options, BlockIter* input_iter);
+
+  InternalIterator* NewIndexIterator(const ReadOptions& read_options) override;
 
   // Converts an index entry (i.e. an encoded BlockHandle) into an iterator over the contents of
   // a correspoding block. Updates and returns input_iter if the one is specified, or returns
@@ -234,10 +233,12 @@ class BlockBasedTable : public TableReader {
       BlockHandle* filter_block_handle) const;
 
   // Returns key to be added to filter or verified against filter based on internal_key.
-  Slice GetFilterKeyFromInternalKey(const Slice &internal_key) const;
+  Slice GetFilterKeyFromInternalKey(Slice internal_key) const;
 
   // Returns key to be added to filter or verified against filter based on user_key.
-  Slice GetFilterKeyFromUserKey(const Slice& user_key) const;
+  // filter_key_cache could be reused only with the same user key.
+  Slice GetFilterKeyFromUserKey(Slice user_key, FilterKeyCache* filter_key_cache) const;
+  Slice GetFilterKeyFromUserKey(Slice user_key) const;
 
   // If `no_io == true`, we will not try to read filter/index from sst file (except fixed-size
   // filter blocks) were they not present in cache yet.
@@ -247,7 +248,8 @@ class BlockBasedTable : public TableReader {
   // prefix, because prefix for the key goes to the same filter block as key itself.
   CachableEntry<FilterBlockReader> GetFilter(const QueryId query_id,
                                              bool no_io = false,
-                                             const Slice* filter_key = nullptr) const;
+                                             const Slice* filter_key = nullptr,
+                                             Statistics* statistics = nullptr) const;
 
   // Returns index reader.
   // If index reader is not stored in either block or internal cache:
@@ -310,7 +312,7 @@ class BlockBasedTable : public TableReader {
 
   // Create the filter from the filter block.
   static FilterBlockReader* ReadFilterBlock(const BlockHandle& filter_block, Rep* rep,
-      size_t* filter_size = nullptr);
+      size_t* filter_size = nullptr, Statistics* statistics = nullptr);
 
   // CreateFilterIndexReader from sst
   Status CreateFilterIndexReader(std::unique_ptr<IndexReader>* filter_index_reader);
@@ -335,5 +337,3 @@ class BlockBasedTable : public TableReader {
 };
 
 }  // namespace rocksdb
-
-#endif  // YB_ROCKSDB_TABLE_BLOCK_BASED_TABLE_READER_H

@@ -1444,8 +1444,8 @@ SELECT attname, most_common_vals FROM pg_stats
 -- Collation support
 -- Running in serializable mode to pick up rows created within the separate DDL transaction.
 --
-BEGIN;
-SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+-- TODO(#12494): reverse this change
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 CREATE TABLE coll_t (c) AS VALUES ('bar'::text);
 CREATE POLICY coll_p ON coll_t USING (c < ('foo'::text COLLATE "C"));
 ALTER TABLE coll_t ENABLE ROW LEVEL SECURITY;
@@ -1880,6 +1880,26 @@ DROP OPERATOR <<< (int, int);
 DROP FUNCTION op_leak(int, int);
 RESET SESSION AUTHORIZATION;
 DROP TABLE rls_tbl;
+
+-- CVE-2023-2455: inlining an SRF may introduce an RLS dependency
+create table rls_t (c text);
+insert into rls_t values ('invisible to bob');
+alter table rls_t enable row level security;
+grant select on rls_t to regress_rls_alice, regress_rls_bob;
+create policy p1 on rls_t for select to regress_rls_alice using (true);
+create policy p2 on rls_t for select to regress_rls_bob using (false);
+create function rls_f () returns setof rls_t
+  stable language sql
+  as $$ select * from rls_t $$;
+prepare q as select current_user, * from rls_f();
+set role regress_rls_alice;
+execute q;
+set role regress_rls_bob;
+execute q;
+
+RESET ROLE;
+DROP FUNCTION rls_f();
+DROP TABLE rls_t;
 
 --
 -- Clean up objects

@@ -1,42 +1,73 @@
 {
-  "docVersions":
+  "dbVersions":
   [
     {
-      "series": "v2.15",
-      "display": "v2.15 (Preview)",
-      "version": "2.15.2.0",
-      "versionShort": "2.15.2",
-      "appVersion": "2.15.2.0-b87",
-      "alias": "preview"
+      "series": "v2.21",
+      "alias": "preview",
+      "display": "v2.21 (Preview)",
+      "version": "2.21.0.0",
+      "versionShort": "2.21.0",
+      "appVersion": "2.21.0.0-b545",
+      "isStable": false,
+      "initialRelease": "2024-03-26"
+    },
+    {
+      "series": "v2.20",
+      "alias": "stable",
+      "display": "v2.20 (LTS)",
+      "version": "2.20.3.0",
+      "versionShort": "2.20.3",
+      "appVersion": "2.20.3.0-b68",
+      "isStable": true,
+      "isLTS": true,
+      "initialRelease": "2023-11-13",
+      "endOfMaintenance": "2025-11-13",
+      "endOfLife": "2026-05-13",
+      "PreviewBehindStable": false
+    },
+    {
+      "series": "v2.18",
+      "display": "v2.18 (STS)",
+      "version": "2.18.7.0",
+      "versionShort": "2.18.7",
+      "appVersion": "2.18.7.0-b30",
+      "isStable": true,
+      "isLTS": false,
+      "isSTS": true,
+      "initialRelease": "2023-05-16",
+      "endOfMaintenance": "2024-05-16",
+      "endOfLife": "2024-11-16"
+    },
+    {
+      "series": "v2.16",
+      "display": "v2.16 (STS)",
+      "version": "2.16.9.0",
+      "versionShort": "2.16.9",
+      "appVersion": "2.16.9.0-b67",
+      "isStable": true,
+      "isLTS": false,
+      "isSTS": true,
+      "initialRelease": "2022-12-14",
+      "endOfMaintenance": "2023-12-14",
+      "endOfLife": "2024-06-14"
     },
     {
       "series": "v2.14",
-      "display": "v2.14 (Stable)",
-      "version": "2.14.2.0",
-      "versionShort": "2.14.2",
-      "appVersion": "2.14.2.0-b25",
-      "alias": "stable"
-    },
-    {
-      "series": "v2.12",
-      "display": "v2.12",
-      "version": "2.12.10.0",
-      "versionShort": "2.12.10",
-      "appVersion": "2.12.10.0-b41"
-    },
-    {
-      "series": "v2.8",
-      "display": "v2.8",
-      "version": "2.8.9.0",
-      "versionShort": "2.8.9",
-      "appVersion": "2.8.9.0-b14"
-    },
-    {
-      "series": "v2.6",
-      "display": "v2.6",
-      "version": "2.6.19.0",
-      "versionShort": "2.6.19",
-      "appVersion": "2.6.19.0-b15"
+      "display": "v2.14 (LTS)",
+      "version": "2.14.15.0",
+      "versionShort": "2.14.15",
+      "appVersion": "2.14.15.0-b57",
+      "isStable": true,
+      "isLTS": true,
+      "initialRelease": "2022-07-14",
+      "endOfMaintenance": "2024-07-14",
+      "endOfLife": "2025-01-14"
     }
+  ],
+  "ybaVersions":
+  [
+  ],
+  "workloadGenVersions":
+  [
   ]
 }

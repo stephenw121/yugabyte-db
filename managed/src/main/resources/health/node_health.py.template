@@ -55,13 +55,14 @@ POSTGRES = "postgres"
 ALERT_ENHANCEMENTS_RELEASE_BUILD = "2.6.0.0-b0"
 RELEASE_BUILD_PATTERN = "(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)[-](.+)"
 BUILD_NUMBER_PATTERN = "b(\\d+).*"
+CQL_AUTH_FAILURE_MESSAGE = \
+        "AuthenticationFailed('Remote end requires authentication"
 
 K8S_CERTS_PATH = "/opt/certs/yugabyte/"
 K8S_CERT_FILE_PATH = os.path.join(K8S_CERTS_PATH, "ca.crt")
 
 K8S_CLIENT_CERTS_PATH = "/root/.yugabytedb/"
 K8S_CLIENT_CA_CERT_FILE_PATH = os.path.join(K8S_CLIENT_CERTS_PATH, "root.crt")
-K8S_CLIENT_CERT_FILE_PATH = os.path.join(K8S_CLIENT_CERTS_PATH, "yugabytedb.crt")
 
 RECENT_FAILURE_THRESHOLD_SEC = 8 * 60
 FATAL_TIME_THRESHOLD_MINUTES = 12
@@ -163,6 +164,12 @@ YB_NODE_OOM_KILLS_10MIN = MetricDefinition(
 YB_NODE_POSTGRES_RSS = MetricDefinition(
     "yb_node_postgres_rss",
     "Total RSS of all processes of particular type")
+YB_NODE_YSQL_CGROUP_LIMIT = MetricDefinition(
+    "yb_node_ysql_cgroup_limit",
+    "Memory limit for ysql cgroup")
+YB_NODE_YSQL_CGROUP_USAGE = MetricDefinition(
+    "yb_node_ysql_cgroup_usage",
+    "Memory usage for ysql cgroup")
 YB_NODE_IS_MASTER_LEADER = MetricDefinition(
     "yb_node_is_master_leader",
     "Master leadership status")
@@ -206,7 +213,7 @@ YB_NODE_CONTROLLER_CHECK = MetricDefinition(
 
 
 def generate_ts():
-    return local_time().strftime('%Y-%m-%d %H:%M:%S')
+    return local_time().strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 class EntryType:
@@ -218,7 +225,8 @@ class EntryType:
     LABELS = "labels"
     NODE = "node"
     NODE_NAME = "node_name"
-    TIMESTAMP = "timestamp"
+    NODE_IDENTIFIER = "node_identifier"
+    TIMESTAMP = "timestamp_iso"
     MESSAGE = "message"
     DETAILS = "details"
     METRICS = "metrics"
@@ -304,11 +312,13 @@ class Metric:
 
 
 class Entry:
-    def __init__(self, message, node, process=None, node_name=None, metrics_only=False):
+    def __init__(self, message, node, process=None, node_name=None, node_identifier=None,
+                 metrics_only=False):
         self.timestamp = generate_ts()
         self.message = message
         self.node = node
         self.node_name = node_name
+        self.node_identifier = node_identifier
         self.process = process
         self.metrics_only = metrics_only
         self.health_check = True
@@ -342,6 +352,7 @@ class Entry:
         j = {
             EntryType.NODE: self.node,
             EntryType.NODE_NAME: self.node_name or "",
+            EntryType.NODE_IDENTIFIER: self.node_identifier or "",
             EntryType.TIMESTAMP: self.timestamp,
             EntryType.MESSAGE: self.message,
             EntryType.DETAILS: self.details,
@@ -422,7 +433,7 @@ class Report:
 
     def as_json(self):
         j = {
-            "timestamp": self.start_ts,
+            "timestamp_iso": self.start_ts,
             "data": [entry.as_json() for entry in self.entries]
         }
         return json.dumps(j, indent=2)
@@ -478,17 +489,19 @@ def get_rss_from_statm(statm):
 
 class NodeChecker():
 
-    def __init__(self, node, node_name, master_index, tserver_index, is_k8s, yb_home_dir,
-                 start_time_ms, ysql_port, ycql_port, redis_port, enable_tls_client,
-                 enable_tls, root_and_client_root_ca_same, ssl_protocol, enable_ysql,
-                 enable_ysql_auth, master_http_port, tserver_http_port, ysql_server_http_port,
-                 node_version, is_ybc_enabled, ybc_port):
+    def __init__(self, node, node_name, node_identifier, master_index, tserver_index, is_k8s,
+                 yb_home_dir, ybc_dir, start_time_ms, ysql_port, ycql_port, redis_port,
+                 enable_tls_client, enable_tls, root_and_client_root_ca_same, ssl_protocol,
+                 enable_ysql, enable_ysql_auth, master_http_port, tserver_http_port,
+                 ysql_server_http_port, node_version, is_ybc_enabled, ybc_port):
         self.node = node
         self.node_name = node_name
+        self.node_identifier = node_identifier
         self.master_index = master_index
         self.tserver_index = tserver_index
         self.start_time_ms = start_time_ms
         self.yb_home_dir = yb_home_dir
+        self.ybc_dir = ybc_dir
         self.enable_tls_client = enable_tls_client
         self.enable_tls = enable_tls
         self.root_and_client_root_ca_same = root_and_client_root_ca_same
@@ -508,10 +521,10 @@ class NodeChecker():
         self.additional_info = {}
 
     def _new_entry(self, message, process=None):
-        return Entry(message, self.node, process, self.node_name)
+        return Entry(message, self.node, process, self.node_name, self.node_identifier)
 
     def _new_metric_entry(self, message, process=None):
-        return Entry(message, self.node, process, self.node_name, True)
+        return Entry(message, self.node, process, self.node_name, self.node_identifier, True)
 
     def _check_output(self, cmd, success_statuses=[0]):
         command = wrap_command(cmd)
@@ -593,9 +606,9 @@ class NodeChecker():
         delta = expiry_date - datetime.now()
         days_till_expiry = delta.days
         metric = Metric.from_definition(metric_definition).add_value(days_till_expiry)
-        if days_till_expiry == 0:
+        if days_till_expiry >=0 and days_till_expiry < 30:
             return e.fill_and_return_entry(
-                ['{} certificate expires today'.format(cert_name)],
+                ['{} certificate will expire in {} days'.format(cert_name, days_till_expiry)],
                 has_error=True,
                 metrics=[metric])
         if days_till_expiry < 0:
@@ -649,12 +662,6 @@ class NodeChecker():
 
         return os.path.join(self.yb_home_dir, ".yugabytedb/root.crt")
 
-    def get_client_certificate_path(self):
-        if self.is_k8s:
-            return K8S_CLIENT_CERT_FILE_PATH
-
-        return os.path.join(self.yb_home_dir, ".yugabytedb/yugabytedb.crt")
-
     def check_node_to_node_ca_certificate_expiration(self):
         return self.check_certificate_expiration("Node To Node CA",
                                                  self.get_node_to_node_ca_certificate_path(),
@@ -686,18 +693,12 @@ class NodeChecker():
                                                  False
                                                  )
 
-    def check_client_certificate_expiration(self):
-        return self.check_certificate_expiration("Client",
-                                                 self.get_client_certificate_path(),
-                                                 HEALTH_CHECK_CLIENT_CERT_VALIDITY_DAYS,
-                                                 False
-                                                 )
-
     def http_request(self, endpoint, output_status=False):
         if output_status:
-            cmd = 'curl -s -o /dev/null --head -w "%{{http_code}}" {}'.format(endpoint)
+            cmd = 'curl -s -L --insecure -o /dev/null --head ' \
+                     '-w "%{{http_code}}" {}'.format(endpoint)
         else:
-            cmd = 'curl -s {}'.format(endpoint)
+            cmd = 'curl -s -L --insecure {}'.format(endpoint)
 
         output = self._check_output(cmd).strip()
         if has_errors(output):
@@ -986,6 +987,54 @@ class NodeChecker():
             .add_value(rss, [Label("process", "workers")])
         return e.fill_and_return_entry([rss], has_error=False, metrics=[metric])
 
+    def check_ysql_cgroup_memory_limit(self):
+        logging.info("Checking cgroup memory limit on node {}".format(self.node))
+        e = self._new_metric_entry("Cgroup memory limit")
+        try:
+            # check if the cgroup exists by looking at /sys/fs/cgroup/memory/ysql
+            # if it exists, then we have cgroup v1.
+            # if it does not exist, then we look at /sys/fs/cgroup/user.slice/...
+            #   This folder is for cgroup v2.
+            # otherwise 0
+            cmd = 'uid=$(id -u); ' \
+                'if [ -d /sys/fs/cgroup/memory/ysql ]; ' \
+                'then cat /sys/fs/cgroup/memory/ysql/memory.limit_in_bytes; ' \
+                'elif [ -d /sys/fs/cgroup/user.slice/user-${uid}.slice/user\@${uid}.service/ysql ]; ' \
+                'then cat /sys/fs/cgroup/user.slice/user-${uid}.slice/user\@${uid}.service/ysql/memory.max; ' \
+                'else echo 0; fi'
+            limit = self._check_output(cmd).strip()
+
+            metric = Metric.from_definition(YB_NODE_YSQL_CGROUP_LIMIT)\
+                .add_value(limit)
+            return e.fill_and_return_entry([limit], has_error=False, metrics=[metric])
+        except Exception as ex:
+            message = str(ex)
+            return e.fill_and_return_entry([message], has_error=True)
+
+    def check_ysql_cgroup_memory_usage(self):
+        logging.info("Checking cgroup memory usage on node {}".format(self.node))
+        e = self._new_metric_entry("Cgroup memory usage")
+        try:
+            # check if the cgroup exists by looking at /sys/fs/cgroup/memory/ysql
+            # if it exists, then we have cgroup v1.
+            # if it does not exist, then we look at /sys/fs/cgroup/user.slice/...
+            #   This folder is for cgroup v2.
+            # otherwise 0
+            cmd = 'uid=$(id -u); ' \
+                'if [ -d /sys/fs/cgroup/memory/ysql ]; ' \
+                'then cat /sys/fs/cgroup/memory/ysql/memory.usage_in_bytes; ' \
+                'elif [ -d /sys/fs/cgroup/user.slice/user-${uid}.slice/user\@${uid}.service/ysql ]; ' \
+                'then cat /sys/fs/cgroup/user.slice/user-${uid}.slice/user\@${uid}.service/ysql/memory.current; ' \
+                'else echo 0; fi'
+            usage = self._check_output(cmd).strip()
+
+            metric = Metric.from_definition(YB_NODE_YSQL_CGROUP_USAGE)\
+                .add_value(usage)
+            return e.fill_and_return_entry([usage], has_error=False, metrics=[metric])
+        except Exception as ex:
+            message = str(ex)
+            return e.fill_and_return_entry([message], has_error=True)
+
     def check_ysql_connections_count(self):
         logging.info("Checking ysql connections count on node {}".format(self.node))
         e = self._new_metric_entry("YSQL connections")
@@ -1126,7 +1175,7 @@ class NodeChecker():
         return os.path.join(self.yb_home_dir, "tserver")
 
     def yb_controller_dir(self):
-        return os.path.join(self.yb_home_dir, "controller")
+        return os.path.join(self.ybc_dir, "controller")
 
     def check_cqlsh(self):
         logging.info("Checking cqlsh works for node {}".format(self.node))
@@ -1152,7 +1201,7 @@ class NodeChecker():
         errors = []
         if not ('Connected to local cluster at {}:{}'
                 .format(self.node, self.ycql_port) in output or
-                "AuthenticationFailed('Remote end requires authentication.'" in output):
+                CQL_AUTH_FAILURE_MESSAGE in output):
             errors = [output]
 
         has_errors = len(errors) > 0
@@ -1184,11 +1233,10 @@ class NodeChecker():
             # If YSQL-auth is enabled, we'll try connecting over the UNIX domain socket in the hopes
             # that we can circumvent md5 authentication (assumption made:
             # "local all yugabyte trust" is in the hba file)
-            socket_fds_output = self._check_output("ls /tmp/.yb.*/.s.PGSQL.*").strip()
+            socket_fds_output = self._check_output('ls {{TMP_DIR}}/.yb.*/.s.PGSQL.*').strip()
             socket_fds = socket_fds_output.split()
             if ("Error" not in socket_fds_output) and len(socket_fds):
                 host = os.path.dirname(socket_fds[0])
-                port_args = ""
             else:
                 raise RuntimeError("Could not find local socket")
 
@@ -1273,9 +1321,7 @@ class NodeChecker():
         self.kill_spawned_postgres_workers()
 
         metric.add_value(0)
-        # It's metric-only check, hence we do set has_error=False to avoid retries -
-        # - as we retried in the check itself
-        return e.fill_and_return_entry([output], has_error=False, metrics=[metric])
+        return e.fill_and_return_entry([output], has_error=True, metrics=[metric])
 
     def check_clock_skew(self):
         logging.info("Checking clock synchronization on node {}".format(self.node))
@@ -1516,8 +1562,10 @@ class NodeInfo:
         self.tserver_index = data["tserverIndex"]
         self.is_k8s = data["k8s"]
         self.yb_home_dir = data["ybHomeDir"]
+        self.ybc_dir = data["ybcDir"]
         self.node_host = data["nodeHost"]
         self.node_name = data["nodeName"]
+        self.node_identifier = data["nodeIdentifier"]
         self.node_start_time = data.get("nodeStartTime")
         self.enable_tls = data["enableTls"]
         self.enable_tls_client = data["enableTlsClient"]
@@ -1536,6 +1584,8 @@ class NodeInfo:
         self.ysql_server_http_port = data["ysqlServerHttpPort"]
         self.check_clock = data["checkClock"]
         self.test_read_write = data["testReadWrite"]
+        self.test_ysqlsh_connectivity = data["testYsqlshConnectivity"]
+        self.test_cqlsh_connectivity = data["testCqlshConnectivity"]
         self.universe_uuid = data["universeUuid"]
         self.is_ybc_enabled = data["enableYbc"]
         self.ybc_port = data["ybcPort"]
@@ -1555,6 +1605,10 @@ def main():
                         help='Time to wait between retries of failed checks.')
     args = parser.parse_args()
 
+    if args.metrics_only:
+        logger = logging.getLogger()
+        logger.disabled = True
+
     # Allow passing node info as argument, otherwise get pre-defined during script upload
     n = NodeInfo(json.loads(args.node_info if args.node_info is not None else NODE_INFO))
     coordinator = CheckCoordinator(args.retry_interval_secs)
@@ -1566,15 +1620,35 @@ def main():
         alert_enhancements_version = True
     report = Report()
     checker = NodeChecker(
-        n.node_host, n.node_name, n.master_index, n.tserver_index, n.is_k8s, n.yb_home_dir,
-        n.node_start_time, n.ysql_port, n.ycql_port, n.redis_port, n.enable_tls_client,
-        n.enable_tls, n.root_and_client_root_ca_same, n.ssl_protocol, n.enable_ysql,
-        n.enable_ysql_auth, n.master_http_port, n.tserver_http_port,
+        n.node_host, n.node_name, n.node_identifier, n.master_index, n.tserver_index, n.is_k8s,
+        n.yb_home_dir, n.ybc_dir, n.node_start_time, n.ysql_port, n.ycql_port, n.redis_port,
+        n.enable_tls_client, n.enable_tls, n.root_and_client_root_ca_same, n.ssl_protocol,
+        n.enable_ysql, n.enable_ysql_auth, n.master_http_port, n.tserver_http_port,
         n.ysql_server_http_port, n.yb_version, n.is_ybc_enabled, n.ybc_port)
 
     coordinator.add_precheck(checker, "check_openssl_availability")
 
     coordinator.add_check(checker, "check_node_metrics_collection")
+    coordinator.add_check(checker, "check_disk_utilization")
+    coordinator.add_check(checker, "check_for_core_files")
+    if n.enable_tls:
+        coordinator.add_check(checker, "check_node_to_node_ca_certificate_expiration")
+        coordinator.add_check(checker, "check_node_to_node_certificate_expiration")
+    if n.enable_tls_client:
+        coordinator.add_check(checker, "check_client_ca_certificate_expiration")
+        if not n.root_and_client_root_ca_same:
+            coordinator.add_check(checker, "check_client_to_node_ca_certificate_expiration")
+            coordinator.add_check(checker, "check_client_to_node_certificate_expiration")
+
+    if not args.metrics_only:
+        # These checks are not working properly when called from inside the service
+        # Will only call them as part of health checks for now
+        # And metrics will be exposed by Platform
+        if n.tserver_index >= 0:
+            coordinator.add_check(checker, "check_file_descriptors")
+        if n.check_clock:
+            coordinator.add_check(checker, "check_clock_skew")
+
     if n.master_index >= 0:
         coordinator.add_check(checker, "check_uptime_for_process", MASTER)
         if alert_enhancements_version:
@@ -1593,40 +1667,26 @@ def main():
         coordinator.add_check(checker, "check_for_error_logs", TSERVER)
         # Only need to check redis-cli/cqlsh for tserver nodes
         # to be docker/k8s friendly.
-        if n.enable_ycql:
+        if n.enable_ycql and n.test_cqlsh_connectivity:
             coordinator.add_check(checker, "check_cqlsh")
         if n.enable_yedis:
             coordinator.add_check(checker, "check_redis_cli")
         if n.enable_ysql:
-            coordinator.add_check(checker, "check_ysqlsh_connect")
+            if n.test_ysqlsh_connectivity:
+                coordinator.add_check(checker, "check_ysqlsh_connect")
             if n.test_read_write:
                 coordinator.add_check(checker, "check_ysqlsh_read_write")
             coordinator.add_check(checker, "check_postgres_worker_count")
             coordinator.add_check(checker, "check_postmaster_rss")
             coordinator.add_check(checker, "check_postgres_workers_rss")
             coordinator.add_check(checker, "check_ysql_connections_count")
-        coordinator.add_check(checker, "check_disk_utilization")
-        coordinator.add_check(checker, "check_for_core_files")
-        if not args.metrics_only:
-            # These checks are not working properly when called from inside the service
-            # Will only call them as part of health checks for now
-            # And metrics will be exposed by Platform
-            coordinator.add_check(checker, "check_file_descriptors")
-            if n.check_clock:
-                coordinator.add_check(checker, "check_clock_skew")
-        if n.enable_tls:
-            coordinator.add_check(checker, "check_node_to_node_ca_certificate_expiration")
-            coordinator.add_check(checker, "check_node_to_node_certificate_expiration")
-        if n.enable_tls_client:
-            coordinator.add_check(checker, "check_client_ca_certificate_expiration")
-            coordinator.add_check(checker, "check_client_certificate_expiration")
-            if not n.root_and_client_root_ca_same:
-                coordinator.add_check(checker, "check_client_to_node_ca_certificate_expiration")
-                coordinator.add_check(checker, "check_client_to_node_certificate_expiration")
+            coordinator.add_check(checker, "check_ysql_cgroup_memory_limit")
+            coordinator.add_check(checker, "check_ysql_cgroup_memory_usage")
+        if n.is_ybc_enabled:
+            coordinator.add_check(checker, "check_yb_controller_availability", max_tries=3)
+
     if not n.is_k8s:
         coordinator.add_check(checker, "check_oom_kills")
-    if n.is_ybc_enabled:
-        coordinator.add_check(checker, "check_yb_controller_availability", max_tries=3)
 
     entries = coordinator.run()
     for e in entries:
@@ -1640,8 +1700,6 @@ def main():
 
         # Write to stdout to be caught by YW subprocess.
         print(report)
-    else:
-        print(report.to_prom_format())
 
 
 if __name__ == '__main__':

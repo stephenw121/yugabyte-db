@@ -35,7 +35,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 #include <gtest/gtest.h>
 #include <rapidjson/document.h>
 
@@ -53,6 +53,7 @@
 using std::string;
 using std::unordered_set;
 using std::vector;
+using std::pair;
 
 DECLARE_int32(metrics_retirement_age_ms);
 
@@ -94,22 +95,23 @@ class MetricsTest : public YBTest {
   }
 
   void DoAggregationCheck(const PrometheusWriter& writer,
-                          const string& table,
-                         const string& name,
-                         int expected_aggregation,
-                         const MetricEntity::AttributeMap& expected_attrs) {
-    auto attrs_it = writer.aggregated_attributes_.find(table);
-    ASSERT_NE(attrs_it, writer.aggregated_attributes_.end());
-    for (const auto& attr : expected_attrs) {
-      auto attr_it = attrs_it->second.find(attr.first);
-      ASSERT_NE(attr_it, attrs_it->second.end());
-      ASSERT_EQ(attr_it->second, attr.second);
+                          const string& entity_id,
+                          const string& metric_name,
+                          int expected_aggregation_value,
+                          const MetricEntity::AttributeMap& expected_attrs) {
+    auto attrs_it = writer.aggregated_id_to_attributes_.find(entity_id);
+    ASSERT_NE(attrs_it, writer.aggregated_id_to_attributes_.end());
+    auto actual_attrs = attrs_it->second;
+    for (const auto& expected_attr : expected_attrs) {
+      auto actual_attr_it = actual_attrs.find(expected_attr.first);
+      ASSERT_NE(actual_attr_it, actual_attrs.end());
+      ASSERT_EQ(actual_attr_it->second, expected_attr.second);
     }
-    auto metric_it = writer.aggregated_values_.find(name);
+    auto metric_it = writer.aggregated_values_.find(metric_name);
     ASSERT_NE(metric_it, writer.aggregated_values_.end());
-    auto value_it = metric_it->second.find(table);
+    auto value_it = metric_it->second.find(entity_id);
     ASSERT_NE(value_it, metric_it->second.end());
-    ASSERT_EQ(value_it->second, expected_aggregation);
+    ASSERT_EQ(value_it->second, expected_aggregation_value);
   }
 
   std::string dumpPrometheusWriterOutput(const PrometheusWriter& w) { return w.output_->str(); }
@@ -227,8 +229,11 @@ TEST_F(MetricsTest, TEstExposeGaugeAsCounter) {
   ASSERT_EQ(MetricType::kCounter, METRIC_counter_as_gauge.type());
 }
 
-METRIC_DEFINE_histogram_with_percentiles(test_entity, test_hist, "Test Histogram",
+METRIC_DEFINE_histogram(test_entity, test_hist, "Test Histogram",
                         MetricUnit::kMilliseconds, "A default histogram.", 100000000L, 2);
+
+METRIC_DEFINE_event_stats(test_entity, test_event_stats, "Test Event Stats",
+                          MetricUnit::kMilliseconds, "A default event stats.");
 
 METRIC_DEFINE_entity(tablet);
 
@@ -239,18 +244,18 @@ METRIC_DEFINE_gauge_int32(tablet, test_max_gauge, "Test Max", MetricUnit::kMilli
                           {0, yb::AggregationFunction::kMax} /* optional_args */);
 
 TEST_F(MetricsTest, AggregationTest) {
-  const pair<string, string> tablets[] = {{"tablet1", "table1"},
-                                          {"tablet2", "table1"},
-                                          {"tablet3", "table2"},
-                                          {"tablet4", "table2"}};
+  const pair<string, string> tablets[] = {{"tablet_1", "table_1"},
+                                          {"tablet_2", "table_1"},
+                                          {"tablet_3", "table_2"},
+                                          {"tablet_4", "table_2"}};
   std::map<std::string, scoped_refptr<MetricEntity>> entities;
   vector<scoped_refptr<Gauge>> gauges;
   int counter = 10;
   for (const auto& tablet : tablets) {
     MetricEntity::AttributeMap entity_attr;
-    entity_attr["tablet_id"] = tablet.first;
+    entity_attr["tablet_id"] = tablet.first + "_id";
     entity_attr["table_name"] = tablet.second;
-    entity_attr["table_id"] = tablet.second;
+    entity_attr["table_id"] = tablet.second + "_id";
     auto entity = METRIC_ENTITY_tablet.Instantiate(&registry_, tablet.first, entity_attr);
 
     // Test SUM aggregation
@@ -266,34 +271,36 @@ TEST_F(MetricsTest, AggregationTest) {
     gauges.emplace_back(max_gauge);
     entities.insert({tablet.first, entity});
   }
+
+  MetricPrometheusOptions opts;
   {
-    MetricPrometheusOptions opts;
     std::stringstream output;
-    PrometheusWriter writer(&output, AggregationMetricLevel::kTable);
-    MetricEntityOptions entity_options;
-    entity_options.metrics.push_back("*");
+    PrometheusWriter writer(&output, opts);
     for (const auto& tablet : tablets) {
-      ASSERT_OK(entities[tablet.first]->WriteForPrometheus(&writer, entity_options, opts));
+      ASSERT_OK(entities[tablet.first]->WriteForPrometheus(&writer, opts));
     }
-    MetricEntity::AttributeMap attrs;
-    attrs["table_id"] = "table1";
-    DoAggregationCheck(writer, "table1", METRIC_test_sum_gauge.name(), 19, attrs);
-    DoAggregationCheck(writer, "table1", METRIC_test_max_gauge.name(), 10, attrs);
-    attrs["table_id"] = "table2";
-    DoAggregationCheck(writer, "table2", METRIC_test_sum_gauge.name(), 15, attrs);
-    DoAggregationCheck(writer, "table2", METRIC_test_max_gauge.name(), 8, attrs);
+    // Check table aggregation.
+    MetricEntity::AttributeMap expected_attrs;
+    expected_attrs["table_id"] = "table_1_id";
+    expected_attrs["table_name"] = "table_1";
+    DoAggregationCheck(writer, "table_1_id", METRIC_test_sum_gauge.name(), 19, expected_attrs);
+    DoAggregationCheck(writer, "table_1_id", METRIC_test_max_gauge.name(), 10, expected_attrs);
+    expected_attrs["table_id"] = "table_2_id";
+    expected_attrs["table_name"] = "table_2";
+    DoAggregationCheck(writer, "table_2_id", METRIC_test_sum_gauge.name(), 15, expected_attrs);
+    DoAggregationCheck(writer, "table_2_id", METRIC_test_max_gauge.name(), 8, expected_attrs);
   }
   {
-    MetricPrometheusOptions opts;
     std::stringstream output;
-    PrometheusWriter writer(&output, AggregationMetricLevel::kServer);
-    MetricEntityOptions entity_options;
-    entity_options.metrics.push_back("*");
+    // Block table level aggregation to make all metrics to be aggregated to server level.
+    opts.priority_regex_string = "";
+    PrometheusWriter writer(&output, opts);
     for (const auto& tablet : tablets) {
-      ASSERT_OK(entities[tablet.first]->WriteForPrometheus(&writer, entity_options, opts));
+      ASSERT_OK(entities[tablet.first]->WriteForPrometheus(&writer, opts));
     }
-    DoAggregationCheck(writer, "", METRIC_test_sum_gauge.name(), 34, {});
-    DoAggregationCheck(writer, "", METRIC_test_max_gauge.name(), 10, {});
+    // Check server aggregation. Using metric_type as entity_id.
+    DoAggregationCheck(writer, "tablet", METRIC_test_sum_gauge.name(), 34, {});
+    DoAggregationCheck(writer, "tablet", METRIC_test_max_gauge.name(), 10, {});
   }
 }
 
@@ -355,6 +362,47 @@ TEST_F(MetricsTest, ResetHistogramTest) {
   EXPECT_EQ(0, hist->histogram_->ValueAtPercentile(100));
 }
 
+TEST_F(MetricsTest, SimpleEventStatsTest) {
+  scoped_refptr<EventStats> stats = METRIC_test_event_stats.Instantiate(entity_);
+  stats->Increment(2);
+  stats->IncrementBy(4, 1);
+  ASSERT_EQ(2, stats->stats_->MinValue());
+  ASSERT_EQ(3, stats->stats_->MeanValue());
+  ASSERT_EQ(4, stats->stats_->MaxValue());
+  ASSERT_EQ(2, stats->stats_->TotalCount());
+  ASSERT_EQ(6, stats->stats_->TotalSum());
+}
+
+TEST_F(MetricsTest, ResetEventStatsTest) {
+  scoped_refptr<EventStats> stats = METRIC_test_event_stats.Instantiate(entity_);
+  for (int i = 1; i <= 100; i++) {
+    stats->Increment(i);
+  }
+  EXPECT_EQ(5050, stats->stats_->TotalSum());
+  EXPECT_EQ(100, stats->stats_->TotalCount());
+  EXPECT_EQ(5050, stats->stats_->CurrentSum());
+  EXPECT_EQ(100, stats->stats_->CurrentCount());
+
+  EXPECT_EQ(1, stats->stats_->MinValue());
+  EXPECT_EQ(50.5, stats->stats_->MeanValue());
+  EXPECT_EQ(100, stats->stats_->MaxValue());
+
+  // Test that the EventStat's min/mean/max are reset.
+  HistogramSnapshotPB snapshot_pb;
+  MetricJsonOptions options;
+  options.include_raw_histograms = true;
+  ASSERT_OK(stats->GetAndResetHistogramSnapshotPB(&snapshot_pb, options));
+
+  EXPECT_EQ(5050, stats->stats_->TotalSum());
+  EXPECT_EQ(100, stats->stats_->TotalCount());
+  EXPECT_EQ(0, stats->stats_->CurrentSum());
+  EXPECT_EQ(0, stats->stats_->CurrentCount());
+
+  EXPECT_EQ(0, stats->stats_->MinValue());
+  EXPECT_EQ(0, stats->stats_->MeanValue());
+  EXPECT_EQ(0, stats->stats_->MaxValue());
+}
+
 TEST_F(MetricsTest, JsonPrintTest) {
   scoped_refptr<Counter> bytes_seen = METRIC_reqs_pending.Instantiate(entity_);
   bytes_seen->Increment();
@@ -363,9 +411,7 @@ TEST_F(MetricsTest, JsonPrintTest) {
   // Generate the JSON.
   std::stringstream out;
   JsonWriter writer(&out, JsonWriter::PRETTY);
-  MetricEntityOptions entity_opts;
-  entity_opts.metrics.push_back("*");
-  ASSERT_OK(entity_->WriteAsJson(&writer, entity_opts, MetricJsonOptions()));
+  ASSERT_OK(entity_->WriteAsJson(&writer, MetricJsonOptions()));
 
   // Now parse it back out.
   JsonReader reader(out.str());
@@ -386,17 +432,11 @@ TEST_F(MetricsTest, JsonPrintTest) {
   string attr_value;
   ASSERT_OK(reader.ExtractString(attributes, "test_attr", &attr_value));
   ASSERT_EQ("attr_val", attr_value);
-
-  // Verify that, if we filter for a metric that isn't in this entity, we get no result.
-  out.str("");
-  entity_opts.metrics = { "not_a_matching_metric" };
-  ASSERT_OK(entity_->WriteAsJson(&writer, entity_opts, MetricJsonOptions()));
-  ASSERT_EQ("", out.str());
 }
 
 // Test that metrics are retired when they are no longer referenced.
 TEST_F(MetricsTest, RetirementTest) {
-  FLAGS_metrics_retirement_age_ms = 100;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_metrics_retirement_age_ms) = 100;
 
   const string kMetricName = "foo";
   scoped_refptr<Counter> counter = METRIC_reqs_pending.Instantiate(entity_);
@@ -438,7 +478,7 @@ TEST_F(MetricsTest, TestRetiringEntities) {
 // Test that we can mark a metric to never be retired.
 TEST_F(MetricsTest, NeverRetireTest) {
   entity_->NeverRetire(METRIC_test_hist.Instantiate(entity_));
-  FLAGS_metrics_retirement_age_ms = 0;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_metrics_retirement_age_ms) = 0;
 
   for (int i = 0; i < 3; i++) {
     entity_->RetireOldMetrics();
@@ -488,7 +528,7 @@ TEST_F(MetricsTest, TestDumpJsonPrototypes) {
   int num_entities = d["entities"].Size();
   LOG(INFO) << "Parsed " << num_metrics << " metrics and " << num_entities << " entities";
   ASSERT_GT(num_metrics, 5);
-  ASSERT_EQ(num_entities, 3);
+  ASSERT_EQ(num_entities, 5);
 
   // Spot-check that some metrics were properly registered and that the JSON was properly
   // formed.
@@ -502,26 +542,140 @@ TEST_F(MetricsTest, TestDumpJsonPrototypes) {
 
 // A basic test to verify PrometheusWriter member functions
 TEST_F(MetricsTest, PrometheusWriter) {
-  static const auto LABLE_1 = "lable1";
-  static const auto LABLE_1_VAL = "lable1_value";
-  static const auto TEST_METRIC_NAME = "test_metric_name";
-  static const int ONCE = 1;
+  static const auto kLabel = "lable1";
+  static const auto kLabelVal = "lable1_value";
+  static const auto kTestMetricName = "test_metric_name";
 
   std::stringstream output;
-  PrometheusWriter writer(&output);
+  MetricPrometheusOptions opts;
+  PrometheusWriter writer(&output, opts);
 
   MetricEntity::AttributeMap attr;
-  attr[LABLE_1] = LABLE_1_VAL;
+  attr[kLabel] = kLabelVal;
 
-  ASSERT_OK(writer.WriteSingleEntryNonTable(attr, TEST_METRIC_NAME, 1u));
+  ASSERT_OK(writer.WriteSingleEntryNonTable(attr, kTestMetricName, 1u));
   std::ostringstream expected;
-  expected << TEST_METRIC_NAME << "{" << LABLE_1 << "=\"" << LABLE_1_VAL << "\"} " << ONCE;
+  expected << kTestMetricName  << "{" << kLabel << "=\"" << kLabelVal << "\"} " << 1;
   auto pw_output = dumpPrometheusWriterOutput(writer);
 
   ASSERT_STR_CONTAINS(pw_output, expected.str());
 
   attr["table_id"] = "table_1";
-  ASSERT_NOK(writer.WriteSingleEntryNonTable(attr, TEST_METRIC_NAME, 1u));
+  ASSERT_NOK(writer.WriteSingleEntryNonTable(attr, kTestMetricName, 1u));
+}
+
+// A test to verify Stream Level Aggregation
+TEST_F(MetricsTest, TestStreamLevelAggregation) {
+  static const auto kLabel = "label";
+  static const auto kLabelVal = "label_value";
+
+  static const auto kTestMetricName1 = "test_metric_name_1";
+  static const auto TestMetricName2 = "test_metric_name_2";
+
+  MetricEntity::AttributeMap attrs;
+  attrs[kLabel] = kLabelVal;
+  attrs["stream_id"] = "stream_id_1";
+  attrs["table_id"] = "table_id_1";
+  attrs["metric_type"] = kXClusterMetricEntityName;
+
+  MetricEntity::AttributeMap expected_attrs = attrs;
+  expected_attrs.erase("table_id");
+
+  std::stringstream output;
+  MetricPrometheusOptions opts;
+  PrometheusWriter writer(&output, opts);
+  ASSERT_OK(writer.WriteSingleEntry(attrs, kTestMetricName1, 1u,
+      AggregationFunction::kMax, kStreamLevel));
+  ASSERT_OK(writer.WriteSingleEntry(attrs, kTestMetricName1, 2u,
+      AggregationFunction::kMax, kStreamLevel));
+  DoAggregationCheck(writer, "stream_id_1", kTestMetricName1, 2, expected_attrs);
+
+  std::stringstream output_2;
+  PrometheusWriter writer_2(&output_2, opts);
+  ASSERT_OK(writer_2.WriteSingleEntry(attrs, TestMetricName2, 1u,
+      AggregationFunction::kSum, kStreamLevel));
+  ASSERT_OK(writer_2.WriteSingleEntry(attrs, TestMetricName2, 1u,
+      AggregationFunction::kSum, kStreamLevel));
+  DoAggregationCheck(writer, "stream_id_1", kTestMetricName1, 2, expected_attrs);
+}
+
+int StringOccurence(const string& s, const string& target) {
+  int occurence = 0;
+  size_t pos = -1;
+  while(true) {
+    pos = s.find(target, pos+1);
+    if (pos == string::npos) {
+      break;
+    }
+    ++occurence;
+  }
+  return occurence;
+}
+
+METRIC_DEFINE_histogram(server, t_hist, "Test Histogram Label",
+    MetricUnit::kMilliseconds, "Test histogram description", 100000000L, 2);
+METRIC_DEFINE_entity(xcluster);
+METRIC_DEFINE_event_stats(xcluster, t_event_stats, "Test EventStats Label",
+    MetricUnit::kMilliseconds, "Test event stats description");
+METRIC_DEFINE_counter(tablet, t_counter, "Test Counter Label", MetricUnit::kMilliseconds,
+    "Test counter description");
+METRIC_DEFINE_gauge_int32(tablet, t_gauge, "Test Gauge Label", MetricUnit::kMilliseconds,
+    "Test gauge description");
+METRIC_DEFINE_entity(cdcsdk);
+METRIC_DEFINE_lag(cdcsdk, t_lag, "Test lag Label", "Test lag description");
+
+// For Prometheus metric output, each metric has a #TYPE and #HELP component.
+// This test validates the format and makes sure the type is correct.
+TEST_F(MetricsTest, VerifyHelpAndTypeTags) {
+  MetricEntity::AttributeMap entity_attr;
+  entity_attr["tablet_id"] = "tablet_id_40";
+  entity_attr["table_name"] = "test_table";
+  entity_attr["table_id"] = "table_id_41";
+  auto tablet_entity =
+      METRIC_ENTITY_tablet.Instantiate(&registry_, "tablet_entity_id_44", entity_attr);
+  auto server_entity = METRIC_ENTITY_server.Instantiate(&registry_, "server_entity_id_45");
+  entity_attr["stream_id"] = "stream_id_46";
+  auto xcluster_entity =
+      METRIC_ENTITY_xcluster.Instantiate(&registry_, "xcluster_entity_id_47", entity_attr);
+  auto cdcsdk_entity =
+      METRIC_ENTITY_cdcsdk.Instantiate(&registry_, "cdcsdk_entity_id_48", entity_attr);
+
+  scoped_refptr<Gauge> gauge = METRIC_t_gauge.Instantiate(tablet_entity, 0);
+  scoped_refptr<Counter> counter = METRIC_t_counter.Instantiate(tablet_entity);
+  scoped_refptr<Histogram> hist = METRIC_t_hist.Instantiate(server_entity);
+  scoped_refptr<EventStats> event_stats = METRIC_t_event_stats.Instantiate(xcluster_entity);
+  scoped_refptr<MillisLag> lag = METRIC_t_lag.Instantiate(cdcsdk_entity);
+
+  MetricPrometheusOptions opts;
+  opts.export_help_and_type = ExportHelpAndType::kTrue;
+  std::stringstream output;
+  PrometheusWriter writer(&output, opts);
+  ASSERT_OK(registry_.WriteForPrometheus(&writer, opts));
+
+  string output_str = output.str();
+  // Check histogram output.
+  EXPECT_EQ(1, StringOccurence(output_str,
+      "# HELP t_hist_sum Test histogram description\n# TYPE t_hist_sum counter"));
+  EXPECT_EQ(1, StringOccurence(output_str,
+      "# HELP t_hist_count Test histogram description\n# TYPE t_hist_count counter"));
+  EXPECT_EQ(6, StringOccurence(output_str,
+      "# HELP t_hist Test histogram description\n# TYPE t_hist gauge"));
+  // Check coarse histogram output.
+  EXPECT_EQ(1, StringOccurence(output_str,
+      "# HELP t_event_stats_sum Test event stats description\n"
+      "# TYPE t_event_stats_sum counter"));
+  EXPECT_EQ(1, StringOccurence(output_str,
+      "# HELP t_event_stats_count Test event stats description\n"
+      "# TYPE t_event_stats_count counter"));
+  // Check gauge output.
+  EXPECT_EQ(1, StringOccurence(output_str,
+      "# HELP t_gauge Test gauge description\n# TYPE t_gauge gauge"));
+  // Check counter output.
+  EXPECT_EQ(1, StringOccurence(output_str,
+      "# HELP t_counter Test counter description\n# TYPE t_counter counter"));
+  // Check lag output.
+  EXPECT_EQ(1, StringOccurence(output_str,
+      "# HELP t_lag Test lag description\n# TYPE t_lag gauge"));
 }
 
 } // namespace yb

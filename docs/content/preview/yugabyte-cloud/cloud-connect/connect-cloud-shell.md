@@ -3,7 +3,6 @@ title: Connect using Cloud Shell
 linkTitle: Cloud Shell
 description: Connect to YugabyteDB Managed clusters from any browser using Cloud Shell
 headcontent: Use your browser to connect to YugabyteDB Managed databases 
-image: /images/section_icons/deploy/enterprise.png
 aliases:
   - /preview/yugabyte-cloud/cloud-quickstart/qs-connect/
 menu:
@@ -76,7 +75,7 @@ admin@ycqlsh:yugabyte>
 
 ## ysqlsh meta-commands in Cloud Shell
 
-Cloud Shell supports the use of ysqlsh [meta-commands](../../../admin/ysqlsh/#meta-commands). However, for security reasons, some commands are not available. With the exception of read-only access to the `/share` directory to load the [sample datasets](../../../sample-data/), commands that access the filesystem do not work in Cloud Shell.
+Cloud Shell supports the use of ysqlsh [meta-commands](../../../admin/ysqlsh-meta-commands/). However, for security reasons, some commands are not available. With the exception of read-only access to the `/share` directory to load the [sample datasets](../../../sample-data/), commands that access the filesystem do not work in Cloud Shell.
 
 The following table lists common meta-commands that can be used in Cloud Shell.
 

@@ -13,20 +13,27 @@
 //
 //
 
-#ifndef YB_UTIL_METRICS_WRITER_H
-#define YB_UTIL_METRICS_WRITER_H
+#pragma once
 
 #include <map>
 
 #include "yb/util/metric_entity.h"
+#include "yb/util/prometheus_metric_filter.h"
 
 namespace yb {
 
+YB_STRONGLY_TYPED_BOOL(ExportHelpAndType);
+
 class PrometheusWriter {
  public:
-  explicit PrometheusWriter(
+  struct MetricHelpAndType {
+    const char* type;
+    const char* help;
+  };
+
+  PrometheusWriter(
       std::stringstream* output,
-      AggregationMetricLevel aggregation_Level = AggregationMetricLevel::kTable);
+      const MetricPrometheusOptions& opts);
 
   virtual ~PrometheusWriter();
 
@@ -45,11 +52,25 @@ class PrometheusWriter {
   }
 
   Status WriteSingleEntry(
-      const MetricEntity::AttributeMap& attr, const std::string& name, int64_t value,
-      AggregationFunction aggregation_function);
+      const MetricEntity::AttributeMap& attr,
+      const std::string& name,
+      int64_t value,
+      AggregationFunction aggregation_function,
+      AggregationLevels default_levels,
+      const char* type = "unknown",
+      const char* description = "unknown");
 
-  Status FlushAggregatedValues(
-      uint32_t max_tables_metrics_breakdowns, const std::string& priority_regex);
+  Status FlushAggregatedValues();
+
+  Status FlushNumberOfEntriesCutOff();
+
+  PrometheusMetricFilter* TEST_GetPrometheusMetricFilter() const {
+    return prometheus_metric_filter_.get();
+  }
+
+  uint32_t TEST_GetNumberOfEntriesCutOff() const {
+    return num_of_entries_cut_off_;
+  }
 
  private:
   friend class MetricsTest;
@@ -59,26 +80,39 @@ class PrometheusWriter {
   virtual Status FlushSingleEntry(
       const MetricEntity::AttributeMap& attr, const std::string& name, int64_t value);
 
+  void FlushHelpAndType(
+      const std::string& name, const char* type, const char* description);
+
   void InvalidAggregationFunction(AggregationFunction aggregation_function);
 
   void AddAggregatedEntry(const std::string& key,
                           const MetricEntity::AttributeMap& attr,
                           const std::string& name, int64_t value,
-                          AggregationFunction aggregation_function);
+                          AggregationFunction aggregation_function,
+                          const char* type, const char* description);
 
-  // Map entity id to attributes
-  std::unordered_map<std::string, MetricEntity::AttributeMap> aggregated_attributes_;
-  // Map entity id to values
-  using EntityValues = std::unordered_map<std::string, int64_t>;
+  // Map metric name to type and description.
+  std::unordered_map<std::string, MetricHelpAndType> metric_help_and_type_;
+
+  using EntityIdToValues = std::unordered_map<std::string, int64_t>;
   // Map from metric name to EntityValues
-  std::unordered_map<std::string, EntityValues> aggregated_values_;
+  std::unordered_map<std::string, EntityIdToValues> aggregated_values_;
+
+  using EntityIdToAttributes = std::unordered_map<std::string, MetricEntity::AttributeMap>;
+  EntityIdToAttributes aggregated_id_to_attributes_;
 
   // Output stream
   std::stringstream* output_;
   // Timestamp for all metrics belonging to this writer instance.
   int64_t timestamp_;
 
-  AggregationMetricLevel aggregation_level_;
+  ExportHelpAndType export_help_and_type_;
+
+  const std::unique_ptr<PrometheusMetricFilter> prometheus_metric_filter_;
+
+  uint32_t remaining_allowed_entries_;
+
+  uint32_t num_of_entries_cut_off_ = 0;
 };
 
 // Native Metrics Storage Writer - writes prometheus metrics into system table.
@@ -87,7 +121,10 @@ class NMSWriter : public PrometheusWriter {
   typedef std::unordered_map<std::string, int64_t> MetricsMap;
   typedef std::unordered_map<std::string, MetricsMap> EntityMetricsMap;
 
-  explicit NMSWriter(EntityMetricsMap* table_metrics, MetricsMap* server_metrics);
+  explicit NMSWriter(
+      EntityMetricsMap* table_metrics,
+      MetricsMap* server_metrics,
+      const MetricPrometheusOptions& opts);
 
  private:
   Status FlushSingleEntry(
@@ -101,5 +138,3 @@ class NMSWriter : public PrometheusWriter {
 };
 
 } // namespace yb
-
-#endif // YB_UTIL_METRICS_WRITER_H

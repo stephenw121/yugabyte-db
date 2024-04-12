@@ -1,10 +1,11 @@
-import React from 'react';
 import { browserHistory } from 'react-router';
 import userEvent from '@testing-library/user-event';
 import { toast } from 'react-toastify';
 import { render, waitFor } from '../../../test-utils';
 import { api } from '../../../redesign/helpers/api';
 import { PromoteInstanceModal } from './PromoteInstanceModal';
+import { ThemeProvider } from '@material-ui/core';
+import { mainTheme } from '../../../redesign/theme/mainTheme';
 
 jest.mock('../../../redesign/helpers/api');
 
@@ -19,12 +20,14 @@ const fakeBackupsList = [
 const setup = () => {
   const onClose = jest.fn();
   const component = render(
-    <PromoteInstanceModal
-      visible
-      onClose={onClose}
-      configId={fakeConfigId}
-      instanceId={fakeInstanceId}
-    />
+    <ThemeProvider theme={mainTheme}>
+      <PromoteInstanceModal
+        visible
+        onClose={onClose}
+        configId={fakeConfigId}
+        instanceId={fakeInstanceId}
+      />
+    </ThemeProvider>
   );
 
   return { component, onClose };
@@ -77,7 +80,7 @@ describe('HA promote instance modal', () => {
     expect(browserHistoryPush).not.toBeCalled();
 
     // click confirmation checkbox and then click continue button
-    userEvent.click(component.getByRole('checkbox'));
+    userEvent.click(component.getByTestId('confirmedCheckbox'));
     userEvent.click(component.getByRole('button', { name: /continue/i }));
 
     // make sure modal can't be closed while API response is pending
@@ -87,7 +90,12 @@ describe('HA promote instance modal', () => {
     // resolve mocked api call
     await waitFor(() => {
       promise.resolve();
-      expect(api.promoteHAInstance).toBeCalledWith(fakeConfigId, fakeInstanceId, fakeBackupsList[0]);
+      expect(api.promoteHAInstance).toBeCalledWith(
+        fakeConfigId,
+        fakeInstanceId,
+        false /* isForcePromote */,
+        { backup_file: fakeBackupsList[0] }
+      );
       expect(browserHistoryPush).toBeCalledWith('/login');
     });
   });
@@ -97,23 +105,26 @@ describe('HA promote instance modal', () => {
     jest.spyOn(browserHistory, 'push').mockImplementation(browserHistoryPush);
     const toastError = jest.fn();
     jest.spyOn(toast, 'error').mockImplementation(toastError);
-    const consoleError = jest.fn();
-    jest.spyOn(console, 'error').mockImplementation(consoleError);
-    (api.promoteHAInstance as jest.Mock).mockRejectedValue({});
+    (api.promoteHAInstance as jest.Mock).mockRejectedValue(
+      new Error('Could not find leader instance')
+    );
     (api.getHABackups as jest.Mock).mockResolvedValue(fakeBackupsList);
 
-    const { component, onClose } = setup();
+    const { component } = setup();
     await waitFor(() => api.getHABackups);
 
-    userEvent.click(component.getByRole('checkbox'));
+    userEvent.click(component.getByTestId('confirmedCheckbox'));
     userEvent.click(component.getByRole('button', { name: /continue/i }));
 
     await waitFor(() => {
-      expect(api.promoteHAInstance).toBeCalledWith(fakeConfigId, fakeInstanceId, fakeBackupsList[0]);
+      expect(api.promoteHAInstance).toBeCalledWith(
+        fakeConfigId,
+        fakeInstanceId,
+        false /* isForcePromote */,
+        { backup_file: fakeBackupsList[0] }
+      );
       expect(browserHistoryPush).not.toBeCalled();
       expect(toastError).toBeCalled();
-      expect(consoleError).toBeCalled();
-      expect(onClose).toBeCalled();
     });
   });
 });

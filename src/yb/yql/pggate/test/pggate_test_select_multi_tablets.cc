@@ -14,12 +14,15 @@
 //--------------------------------------------------------------------------------------------------
 
 #include "yb/common/constants.h"
-#include "yb/common/ybc-internal.h"
+#include "yb/common/value.messages.h"
 
 #include "yb/util/status_log.h"
 
 #include "yb/yql/pggate/test/pggate_test.h"
+#include "yb/yql/pggate/util/ybc-internal.h"
 #include "yb/yql/pggate/ybc_pggate.h"
+
+using std::string;
 
 namespace yb {
 namespace pggate {
@@ -46,7 +49,9 @@ TEST_F(PggateTestSelectMultiTablets, TestSelectMultiTablets) {
                                        kColocationIdNotSet /* colocation_id */,
                                        kInvalidOid /* tablespace_id */,
                                        false /* is_matview */,
-                                       kInvalidOid /* matview_pg_table_id */,
+                                       kInvalidOid /* pg_table_oid */,
+                                       kInvalidOid /* old_relfilenode_oid */,
+                                       false /* is_truncate */,
                                        &pg_stmt));
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "hash_key", ++col_count,
                                                DataType::INT64, true, true));
@@ -60,7 +65,7 @@ TEST_F(PggateTestSelectMultiTablets, TestSelectMultiTablets) {
                                                DataType::FLOAT, false, false));
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "job", ++col_count,
                                                DataType::STRING, false, false));
-  CHECK_YBC_STATUS(YBCPgExecCreateTable(pg_stmt));
+  ExecCreateTableTransaction(pg_stmt);
   pg_stmt = nullptr;
 
   // SELECT: Empty Table ---------------------------------------------------------------------------
@@ -102,8 +107,9 @@ TEST_F(PggateTestSelectMultiTablets, TestSelectMultiTablets) {
 
   // INSERT ----------------------------------------------------------------------------------------
   // Allocate new insert.
-  CHECK_YBC_STATUS(YBCPgNewInsert(kDefaultDatabaseOid, tab_oid, false /* is_single_row_txn */,
-                                  false /* is_region_local */, &pg_stmt));
+  CHECK_YBC_STATUS(YBCPgNewInsert(
+      kDefaultDatabaseOid, tab_oid, false /* is_region_local */, &pg_stmt,
+      YBCPgTransactionSetting::YB_TRANSACTIONAL));
 
   // Allocate constant expressions.
   // TODO(neil) We can also allocate expression with bind.
@@ -148,7 +154,7 @@ TEST_F(PggateTestSelectMultiTablets, TestSelectMultiTablets) {
     CHECK_YBC_STATUS(YBCPgUpdateConstInt4(expr_projcnt, 100 + seed, false));
     CHECK_YBC_STATUS(YBCPgUpdateConstFloat4(expr_salary, seed + 1.0*seed/10.0, false));
     job = strings::Substitute("Job_title_$0", seed);
-    CHECK_YBC_STATUS(YBCPgUpdateConstChar(expr_job, job.c_str(), job.size(), false));
+    CHECK_YBC_STATUS(YBCPgUpdateConstText(expr_job, job.c_str(), false));
   }
 
   pg_stmt = nullptr;

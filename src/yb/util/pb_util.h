@@ -33,8 +33,7 @@
 // Utilities for dealing with protocol buffers.
 // These are mostly just functions similar to what are found in the protobuf
 // library itself, but using yb::faststring instances instead of STL strings.
-#ifndef YB_UTIL_PB_UTIL_H
-#define YB_UTIL_PB_UTIL_H
+#pragma once
 
 #include <string>
 
@@ -43,6 +42,25 @@
 #include "yb/util/faststring.h"
 #include "yb/util/slice.h"
 #include "yb/util/status_fwd.h"
+
+#define INTERNAL_SCHECK_PB_FIELD_IS_SET(i, pb, field) \
+  if (!pb.BOOST_PP_CAT(has_, field)()) { \
+    _missing_fields.emplace_back(BOOST_PP_STRINGIZE(field)); \
+  }
+
+// Check that the provided fields have been set in the protobuf. If the check fails returns from the
+// function with an InvalidArgument Status who's message containing the list of missing fields.
+// Ex:
+// SCHECK_PB_FIELDS_ARE_SET(req, field_1, field_2, field_3);
+#define SCHECK_PB_FIELDS_ARE_SET(pb, ...) \
+  do { \
+    std::vector<std::string> _missing_fields; \
+    BOOST_PP_SEQ_FOR_EACH( \
+        INTERNAL_SCHECK_PB_FIELD_IS_SET, (pb), BOOST_PP_VARIADIC_TO_SEQ(__VA_ARGS__)) \
+    SCHECK_FORMAT( \
+        _missing_fields.empty(), InvalidArgument, "Missing required arguments: $0", \
+        _missing_fields); \
+  } while (0)
 
 namespace google {
 namespace protobuf {
@@ -69,6 +87,8 @@ class WritableFile;
 namespace pb_util {
 
 using google::protobuf::MessageLite;
+
+static const char* const kTmpTemplateSuffix = ".tmp.XXXXXX";
 
 enum SyncMode {
   SYNC,
@@ -116,6 +136,16 @@ Status WritePBToPath(Env* env, const std::string& path, const MessageLite& msg, 
 // Truncate any 'bytes' or 'string' fields of this message to max_len.
 // The text "<truncated>" is appended to any such truncated fields.
 void TruncateFields(google::protobuf::Message* message, int max_len);
+
+// Form a path ends with kTmpTemplateSuffix.
+inline std::string MakeTempPath(const std::string& path) {
+  return path + kTmpTemplateSuffix;
+}
+
+// Is the file ends with kTmpTemplateSuffix.
+inline bool IsTempFile(const std::string& path) {
+  return path.ends_with(kTmpTemplateSuffix);
+}
 
 // A protobuf "container" has the following format (all integers in
 // little-endian byte order):
@@ -302,7 +332,7 @@ class ReadablePBContainerFile {
   // If 'eofOK' is EOF_OK, an EOF is returned as-is. Otherwise, it is
   // considered to be an invalid short read and returned as an error.
   Status ValidateAndRead(size_t length, EofOK eofOK,
-                                 Slice* result, std::unique_ptr<uint8_t[]>* scratch);
+                         Slice* result, std::unique_ptr<uint8_t[]>* scratch);
 
   size_t offset_;
 
@@ -351,5 +381,3 @@ bool ArePBsEqual(const google::protobuf::Message& prev_pb,
 using RepeatedBytes = google::protobuf::RepeatedPtrField<std::string>;
 
 } // namespace yb
-
-#endif // YB_UTIL_PB_UTIL_H

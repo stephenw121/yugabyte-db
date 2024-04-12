@@ -1,12 +1,13 @@
 ---
-title: Using DBeaver
+title: Using DBeaver with YSQL
+headerTitle: Using DBeaver
 linkTitle: DBeaver
-description: Use the DBeaver multi-platform database tool to explore and query YugabyteDB.
+description: Use the DBeaver multi-platform database tool to explore and query YugabyteDB YSQL.
 menu:
   stable:
     identifier: dbeaver-1-ysql
     parent: tools
-    weight: 40
+    weight: 50
 type: docs
 ---
 
@@ -38,7 +39,7 @@ Before you can start using DBeaver with YSQL, you need to perform the following:
 
 - Start YugabyteDB.
 
-  For more information, see [Quick Start](/quick-start/install).
+  For more information, see [Quick Start](../../quick-start).
 
 - Install JRE or JDK for Java 8 or later.
 
@@ -54,8 +55,8 @@ You can create a connection as follows:
 
 - Launch DBeaver.
 - Navigate to **Database > New Connection** to open the **Connect to database** window shown in the following illustration.
-- In the **Select your database** list, select **YugabyteDB**, and then click **Next**.\
-\
+- In the **Select your database** list, select **YugabyteDB**, and then click **Next**.
+
     ![DBeaver Select Database](/images/develop/tools/dbeaver/dbeaver-select-db.png)
 
 - Use **Connection Settings** to specify the following:
@@ -66,8 +67,8 @@ You can create a connection as follows:
   - **Password**: leave blank if YSQL authentication is not enabled. If enabled, add the password for yugabyte (default is yugabyte).
   - Select **Show all databases**.
 
-- Click **Test Connection** to verify that the connection is successful, as shown in the following illustration:\
-\
+- Click **Test Connection** to verify that the connection is successful, as shown in the following illustration:
+
     ![DBeaver Test connection](/images/develop/tools/dbeaver/dbeaver-connected.png)
 
 DBeaver's **Database Navigator** should display **Yugabyte - localhost**.
@@ -78,4 +79,4 @@ You can expand the list to see all databases available to the Yugabyte User, as 
 
 ## What's Next
 
-For sample databases to explore YugabyteDB using DBeaver, see [Sample datasets](/preview/sample-data/).
+For sample databases to explore YugabyteDB using DBeaver, see [Sample datasets](../../sample-data/).

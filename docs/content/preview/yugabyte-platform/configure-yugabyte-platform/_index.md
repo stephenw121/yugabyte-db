@@ -4,87 +4,45 @@ headerTitle: Configure YugabyteDB Anywhere
 linkTitle: Configure
 description: Configure YugabyteDB Anywhere.
 image: /images/section_icons/deploy/manual-deployment.png
-headcontent: Configure YugabyteDB Anywhere.
 menu:
   preview_yugabyte-platform:
     parent: yugabytedb-anywhere
     identifier: configure-yugabyte-platform
-    weight: 642
+    weight: 620
+aliases:
+  - /preview/yugabyte-platform/overview/configure/
+  - /preview/yugabyte-platform/configure-yugabyte-platform/configure/
 type: indexpage
 ---
 
-<div class="row">
+After YugabytDB Anywhere (YBA) has been installed, the next step is to create provider configurations. A provider configuration comprises all the parameters needed to deploy a YugabyteDB universe on the corresponding provider. This includes cloud credentials, regions and zones, networking details, and more.
 
-  <div class="col-12 col-md-6 col-lg-12 col-xl-6">
-    <a class="section-link icon-offset" href="configure/aws/">
-      <div class="head">
-        <img class="icon" src="/images/section_icons/deploy/manual-deployment.png" aria-hidden="true" />
-        <div class="title">Overview</div>
-      </div>
-      <div class="body">
-        Overview of the configuration process.
-      </div>
-    </a>
-  </div>
+When deploying a universe, YBA uses the provider configuration settings to create and provision the nodes that will make up the universe.
 
-  <div class="col-12 col-md-6 col-lg-12 col-xl-6">
-    <a class="section-link icon-offset" href="supported-os-and-arch/">
-      <div class="head">
-        <img class="icon" src="/images/section_icons/deploy/manual-deployment.png" aria-hidden="true" />
-        <div class="title">Supported operating systems</div>
-      </div>
-      <div class="body">
-        Supported operating systems and architectures.
-      </div>
-    </a>
-  </div>
+{{<index/block>}}
 
-  <div class="col-12 col-md-6 col-lg-12 col-xl-6">
-    <a class="section-link icon-offset" href="create-admin-user/">
-      <div class="head">
-        <img class="icon" src="/images/section_icons/manage/enterprise/edit_universe.png" aria-hidden="true" />
-        <div class="title">Create the admin user</div>
-      </div>
-      <div class="body">
-        Create the admin user.
-      </div>
-    </a>
-  </div>
+  {{<index/item
+    title="Node prerequisites"
+    body="Operating systems and architectures supported by YBA for deploying YugabyteDB universes."
+    href="supported-os-and-arch/"
+    icon="/images/section_icons/deploy/manual-deployment.png">}}
 
-  <div class="col-12 col-md-6 col-lg-12 col-xl-6">
-    <a class="section-link icon-offset" href="set-up-cloud-provider/aws/">
-      <div class="head">
-        <img class="icon" src="/images/section_icons/manage/enterprise/edit_flags.png" aria-hidden="true" />
-        <div class="title">Configure cloud providers</div>
-      </div>
-      <div class="body">
-        Set up providers for on-premises, AWS, GCP, Azure, Kubernetes, OpenShift, Tanzu.
-      </div>
-    </a>
-  </div>
+  {{<index/item
+    title="Create admin user"
+    body="Admin user account registration and setup."
+    href="create-admin-user/"
+    icon="/images/section_icons/index/admin.png">}}
 
-  <div class="col-12 col-md-6 col-lg-12 col-xl-6">
-    <a class="section-link icon-offset" href="backup-target/">
-      <div class="head">
-        <img class="icon" src="/images/section_icons/manage/backup.png" aria-hidden="true" />
-        <div class="title">Configure the backup target</div>
-      </div>
-      <div class="body">
-        Configure the backup target for scheduled backups.
-      </div>
-    </a>
-  </div>
+  {{<index/item
+    title="Configure providers"
+    body="Create provider configurations for deploying universes."
+    href="set-up-cloud-provider/"
+    icon="/images/section_icons/manage/enterprise/edit_universe.png">}}
 
-  <div class="col-12 col-md-6 col-lg-12 col-xl-6">
-    <a class="section-link icon-offset" href="set-up-alerts-health-check/">
-      <div class="head">
-        <img class="icon" src="/images/section_icons/deploy/manual-deployment.png" aria-hidden="true" />
-        <div class="title">Configure alerts and health checks</div>
-      </div>
-      <div class="body">
-        Configure alerts and health checks.
-      </div>
-    </a>
-  </div>
+  {{<index/item
+    title="Configure alerts"
+    body="Create health check and alerts for issues that may affect deployment."
+    href="set-up-alerts-health-check/"
+    icon="/images/section_icons/deploy/manual-deployment.png">}}
 
-</div>
+{{</index/block>}}

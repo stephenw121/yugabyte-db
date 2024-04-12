@@ -12,8 +12,7 @@
 // under the License.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_PGGATE_PG_DML_READ_H_
-#define YB_YQL_PGGATE_PG_DML_READ_H_
+#pragma once
 
 #include <optional>
 #include <utility>
@@ -33,8 +32,7 @@
 #include "yb/yql/pggate/pg_statement.h"
 #include "yb/yql/pggate/pg_tools.h"
 
-namespace yb {
-namespace pggate {
+namespace yb::pggate {
 
 //--------------------------------------------------------------------------------------------------
 // DML_READ
@@ -74,6 +72,14 @@ class PgDmlRead : public PgDml {
   // Set forward (or backward) scan.
   void SetForwardScan(const bool is_forward_scan);
 
+  bool KeepOrder() const;
+
+  // Set prefix length, in columns, of distinct index scans.
+  void SetDistinctPrefixLength(const int distinct_prefix_length);
+
+  // Set scan bounds
+  void SetHashBounds(const uint16_t low_bound, const uint16_t high_bound);
+
   // Bind a range column with a BETWEEN condition.
   Status BindColumnCondBetween(int attr_num, PgExpr *attr_value,
                                bool start_inclusive,
@@ -81,9 +87,18 @@ class PgDmlRead : public PgDml {
                                bool end_inclusive);
 
   // Bind a column with an IN condition.
-  Status BindColumnCondIn(int attnum, int n_attr_values, PgExpr **attr_values);
+  Status BindColumnCondIn(PgExpr *lhs, int n_attr_values, PgExpr **attr_values);
+
+  // Bind a column with an IS NOT NULL condition.
+  Status BindColumnCondIsNotNull(int attr_num);
 
   Status BindHashCode(const std::optional<Bound>& start, const std::optional<Bound>& end);
+
+  // Limit scan to specific ybctid range for parallel scan.
+  // Sets underlying request's bounds to specified values, also resets any psql operations
+  // remaining from the previous range scan.
+  Status BindRange(const Slice &start_value, bool start_inclusive,
+                   const Slice &end_value, bool end_inclusive);
 
   // Add a lower bound to the scan. If a lower bound has already been added
   // this call will set the lower bound to the stricter of the two bounds.
@@ -97,9 +112,14 @@ class PgDmlRead : public PgDml {
 
   // Execute.
   virtual Status Exec(const PgExecParameters *exec_params);
+  Status SetRequestedYbctids(const std::vector<Slice> *ybctids);
+  Status RetrieveYbctidsFromSecondaryIndex(const PgExecParameters *exec_params,
+                                           std::vector<Slice> *ybctids,
+                                           bool *exceeded_work_mem);
+  Status InitDocOpWithRowMark();
 
-  void SetCatalogCacheVersion(const uint64_t catalog_cache_version) override {
-    DCHECK_NOTNULL(read_req_)->set_ysql_catalog_version(catalog_cache_version);
+  void SetCatalogCacheVersion(std::optional<PgOid> db_oid, uint64_t version) override {
+    DoSetCatalogCacheVersion(read_req_.get(), db_oid, version);
   }
 
   void UpgradeDocOp(PgDocOp::SharedPtr doc_op);
@@ -112,7 +132,7 @@ class PgDmlRead : public PgDml {
 
  protected:
   // Allocate column protobuf.
-  LWPgsqlExpressionPB *AllocColumnBindPB(PgColumn *col) override;
+  Result<LWPgsqlExpressionPB*> AllocColumnBindPB(PgColumn* col, PgExpr* expr) override;
   LWPgsqlExpressionPB *AllocColumnBindConditionExprPB(PgColumn *col);
   LWPgsqlExpressionPB *AllocIndexColumnBindPB(PgColumn *col);
 
@@ -141,26 +161,17 @@ class PgDmlRead : public PgDml {
   // Indicates that current operation reads concrete row by specifying row's DocKey.
   bool IsConcreteRowRead() const;
   Status ProcessEmptyPrimaryBinds();
-  bool IsAllPrimaryKeysBound(size_t num_range_components_in_expected);
-  bool CanBuildYbctidsFromPrimaryBinds();
-  Result<std::vector<std::string>> BuildYbctidsFromPrimaryBinds();
-  Status SubstitutePrimaryBindsWithYbctids(const PgExecParameters* exec_params);
-  Result<docdb::DocKey> EncodeRowKeyForBound(
+  [[nodiscard]] bool IsAllPrimaryKeysBound() const;
+  Result<std::vector<Slice>> BuildYbctidsFromPrimaryBinds();
+
+  Status SubstitutePrimaryBindsWithYbctids(const PgExecParameters* exec_params,
+                                           const std::vector<Slice> ybctids);
+  Result<dockv::DocKey> EncodeRowKeyForBound(
       YBCPgStatement handle, size_t n_col_values, PgExpr **col_values, bool for_lower_bound);
-  Status MoveBoundKeyInOperator(PgColumn* col, const LWPgsqlConditionPB& in_operator);
-  Result<LWQLValuePB*> GetBoundValue(
-      const PgColumn& col, const LWPgsqlExpressionPB& src) const;
-  Result<docdb::KeyEntryValue> BuildKeyColumnValue(
-      const PgColumn& col, const LWPgsqlExpressionPB& src, LWQLValuePB** dest);
-  Result<docdb::KeyEntryValue> BuildKeyColumnValue(
-      const PgColumn& col, const LWPgsqlExpressionPB& src);
 
   // Holds original doc_op_ object after call of the UpgradeDocOp method.
   // Required to prevent structures related to request from being freed.
   PgDocOp::SharedPtr original_doc_op_;
 };
 
-}  // namespace pggate
-}  // namespace yb
-
-#endif // YB_YQL_PGGATE_PG_DML_READ_H_
+}  // namespace yb::pggate

@@ -13,19 +13,27 @@
 //
 //
 
-#ifndef YB_UTIL_METRIC_ENTITY_H
-#define YB_UTIL_METRIC_ENTITY_H
+#pragma once
 
 #include <functional>
 #include <map>
 #include <unordered_map>
 
+#include <boost/regex.hpp>
+
 #include "yb/gutil/callback_forward.h"
+#include "yb/gutil/map-util.h"
+
 #include "yb/util/locks.h"
+#include "yb/util/mem_tracker.h"
+#include "yb/util/memory/memory_usage.h"
 #include "yb/util/metrics_fwd.h"
 #include "yb/util/status_fwd.h"
 
 namespace yb {
+
+static const char* const kXClusterMetricEntityName = "xcluster";
+static const char* const kCdcsdkMetricEntityName = "cdcsdk";
 
 class JsonWriter;
 
@@ -46,12 +54,27 @@ enum class MetricLevel {
   kWarn = 2
 };
 
-enum class AggregationMetricLevel {
-  kServer,
-  kTable
+using AggregationLevels = unsigned int;
+constexpr AggregationLevels kServerLevel = 1 << 0;
+constexpr AggregationLevels kStreamLevel = 1 << 1;
+constexpr AggregationLevels kTableLevel = 1 << 2;
+
+using MetricAggregationMap = std::unordered_map<std::string, AggregationLevels>;
+
+struct MetricOptions {
+  // Determine whether system reset histogram or not
+  // Default: false
+  bool reset_histograms = true;
+
+  // Include the metrics at a level and above.
+  // Default: debug
+  MetricLevel level = MetricLevel::kDebug;
+
+  // Missing vector means select all metrics.
+  std::optional<std::vector<std::string>> general_metrics_allowlist;
 };
 
-struct MetricJsonOptions {
+struct MetricJsonOptions : public MetricOptions {
   // Include the raw histogram values and counts in the JSON output.
   // This allows consumers to do cross-server aggregation or window
   // data over time.
@@ -62,29 +85,31 @@ struct MetricJsonOptions {
   // unit, etc).
   // Default: false
   bool include_schema_info = false;
-
-  // Include the metrics at a level and above.
-  // Default: debug
-  MetricLevel level = MetricLevel::kDebug;
 };
 
-struct MetricEntityOptions {
-  std::vector<std::string> metrics;
-  std::vector<std::string> exclude_metrics;
+YB_STRONGLY_TYPED_BOOL(ExportHelpAndType);
 
-  // Regex for metrics that should always be included for all tables.
-  std::string priority_regex;
-};
+static const std::string kFilterVersionOne = "v1";
+static const std::string kFilterVersionTwo = "v2";
 
-using MeticEntitiesOptions = std::map<AggregationMetricLevel, MetricEntityOptions>;
+struct MetricPrometheusOptions : public MetricOptions {
+  // Include #TYPE and #HELP in Prometheus metrics output
+  ExportHelpAndType export_help_and_type{ExportHelpAndType::kFalse};
 
-struct MetricPrometheusOptions {
-  // Include the metrics at a level and above.
-  // Default: debug
-  MetricLevel level = MetricLevel::kDebug;
+  uint32_t max_metric_entries = UINT32_MAX;
 
-  // Number of tables to include metrics for.
-  uint32_t max_tables_metrics_breakdowns;
+  std::string version = kFilterVersionOne;
+
+  // For filtering table level metrics when version is equal to kFilterVersionOne.
+  std::string priority_regex_string = ".*";
+
+  // The four regexs are for filtering table level and server level metrics
+  // when version is equal to kFilterVersionTwo.
+  std::string table_allowlist_string = ".*";
+  std::string table_blocklist_string = "";
+
+  std::string server_allowlist_string = ".*";
+  std::string server_blocklist_string = "";
 };
 
 class MetricEntityPrototype {
@@ -102,7 +127,8 @@ class MetricEntityPrototype {
   scoped_refptr<MetricEntity> Instantiate(
       MetricRegistry* registry,
       const std::string& id,
-      const std::unordered_map<std::string, std::string>& initial_attrs) const;
+      const std::unordered_map<std::string, std::string>& initial_attrs,
+      std::shared_ptr<MemTracker> mem_tracker = nullptr) const;
 
  private:
   const char* const name_;
@@ -117,46 +143,25 @@ enum AggregationFunction {
 
 class MetricEntity : public RefCountedThreadSafe<MetricEntity> {
  public:
-  typedef std::unordered_map<const MetricPrototype*, scoped_refptr<Metric> > MetricMap;
+  typedef std::map<const MetricPrototype*, scoped_refptr<Metric> > MetricMap;
   typedef std::unordered_map<std::string, std::string> AttributeMap;
-  typedef std::function<void (JsonWriter* writer, const MetricJsonOptions& opts)>
-    ExternalJsonMetricsCb;
-  typedef std::function<void (PrometheusWriter* writer, const MetricPrometheusOptions& opts)>
-    ExternalPrometheusMetricsCb;
 
-  scoped_refptr<Counter> FindOrCreateCounter(const CounterPrototype* proto);
-  scoped_refptr<Counter> FindOrCreateCounter(std::unique_ptr<CounterPrototype> proto);
-  scoped_refptr<MillisLag> FindOrCreateMillisLag(const MillisLagPrototype* proto);
-  scoped_refptr<AtomicMillisLag> FindOrCreateAtomicMillisLag(const MillisLagPrototype* proto);
-  scoped_refptr<Histogram> FindOrCreateHistogram(const HistogramPrototype* proto);
-  scoped_refptr<Histogram> FindOrCreateHistogram(std::unique_ptr<HistogramPrototype> proto);
-
-  template<typename T>
-  scoped_refptr<AtomicGauge<T>> FindOrCreateGauge(const GaugePrototype<T>* proto,
-                                                  const T& initial_value);
-
-  template<typename T>
-  scoped_refptr<AtomicGauge<T>> FindOrCreateGauge(std::unique_ptr<GaugePrototype<T>> proto,
-                                                  const T& initial_value);
-
-  template<typename T>
-  scoped_refptr<FunctionGauge<T> > FindOrCreateFunctionGauge(const GaugePrototype<T>* proto,
-                                                             const Callback<T()>& function);
+  template<typename Metric, typename PrototypePtr, typename ...Args>
+  scoped_refptr<Metric> FindOrCreateMetric(PrototypePtr proto, Args&&... args);
 
   // Return the metric instantiated from the given prototype, or NULL if none has been
   // instantiated. Primarily used by tests trying to read metric values.
+  template<typename Metric>
   scoped_refptr<Metric> FindOrNull(const MetricPrototype& prototype) const;
 
   const std::string& id() const { return id_; }
 
   // See MetricRegistry::WriteAsJson()
   Status WriteAsJson(JsonWriter* writer,
-                     const MetricEntityOptions& entity_options,
                      const MetricJsonOptions& opts) const;
 
   Status WriteForPrometheus(PrometheusWriter* writer,
-                            const MetricEntityOptions& entity_options,
-                            const MetricPrometheusOptions& opts) const;
+                            const MetricPrometheusOptions& opts);
 
   const MetricMap& UnsafeMetricsMapForTests() const { return metric_map_; }
 
@@ -180,36 +185,34 @@ class MetricEntity : public RefCountedThreadSafe<MetricEntity> {
   void SetAttribute(const std::string& key, const std::string& val);
 
   size_t num_metrics() const {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return metric_map_.size();
-  }
-
-  void AddExternalJsonMetricsCb(const ExternalJsonMetricsCb &external_metrics_cb) {
-    std::lock_guard<simple_spinlock> l(lock_);
-    external_json_metrics_cbs_.push_back(external_metrics_cb);
-  }
-
-  void AddExternalPrometheusMetricsCb(const ExternalPrometheusMetricsCb&external_metrics_cb) {
-    std::lock_guard<simple_spinlock> l(lock_);
-    external_prometheus_metrics_cbs_.push_back(external_metrics_cb);
   }
 
   const MetricEntityPrototype& prototype() const { return *prototype_; }
 
   void Remove(const MetricPrototype* proto);
 
+  bool TEST_ContainMetricName(const std::string& metric_name) const;
+
  private:
   friend class MetricRegistry;
   friend class RefCountedThreadSafe<MetricEntity>;
 
-  MetricEntity(const MetricEntityPrototype* prototype, std::string id,
-               AttributeMap attributes);
+  MetricEntity(const MetricEntityPrototype* prototype, std::string id, AttributeMap attributes,
+               std::shared_ptr<MemTracker> mem_tracker = nullptr);
   ~MetricEntity();
 
   // Ensure that the given metric prototype is allowed to be instantiated
   // within this entity. This entity's type must match the expected entity
   // type defined within the metric prototype.
   void CheckInstantiation(const MetricPrototype* proto) const;
+
+  template<typename Pointer>
+  void AddConsumption(const Pointer& value) REQUIRES(lock_);
+
+  MetricMap GetFilteredMetricMap(
+      const std::optional<std::vector<std::string>>& match_params_optional) const REQUIRES(lock_);
 
   const MetricEntityPrototype* const prototype_;
   const std::string id_;
@@ -222,18 +225,38 @@ class MetricEntity : public RefCountedThreadSafe<MetricEntity> {
   // The key/value attributes. Protected by lock_
   AttributeMap attributes_;
 
+  std::weak_ptr<MemTracker> mem_tracker_ GUARDED_BY(lock_);
+
   // The set of metrics which should never be retired. Protected by lock_.
   std::vector<scoped_refptr<Metric> > never_retire_metrics_;
-
-  // Callbacks fired each time WriteAsJson is called.
-  std::vector<ExternalJsonMetricsCb> external_json_metrics_cbs_;
-
-  // Callbacks fired each time WriteForPrometheus is called.
-  std::vector<ExternalPrometheusMetricsCb> external_prometheus_metrics_cbs_;
 };
+
+template<typename T>
+void MetricEntity::AddConsumption(const T& value) {
+  if (auto mem_tracker = mem_tracker_.lock()) {
+    mem_tracker->Consume(DynamicMemoryUsageOrSizeOf(value));
+  }
+}
+
+template<typename Metric, typename PrototypePtr, typename ...Args>
+scoped_refptr<Metric> MetricEntity::FindOrCreateMetric(PrototypePtr proto, Args&&... args) {
+  CheckInstantiation(std::to_address(proto));
+  std::lock_guard l(lock_);
+  auto m = down_cast<Metric*>(FindPtrOrNull(metric_map_, std::to_address(proto)).get());
+  if (!m) {
+    m = new Metric(std::move(proto), std::forward<Args>(args)...);
+    InsertOrDie(&metric_map_, m->prototype(), m);
+    AddConsumption(*m);
+  }
+  return m;
+}
+
+template<typename Metric>
+scoped_refptr<Metric> MetricEntity::FindOrNull(const MetricPrototype& prototype) const {
+  std::lock_guard l(lock_);
+  return down_cast<Metric*>(FindPtrOrNull(metric_map_, &prototype).get());
+}
 
 void WriteRegistryAsJson(JsonWriter* writer);
 
 } // namespace yb
-
-#endif // YB_UTIL_METRIC_ENTITY_H

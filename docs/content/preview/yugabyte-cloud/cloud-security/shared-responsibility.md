@@ -1,8 +1,7 @@
 ---
 title: Shared responsibility model
 linkTitle: Shared responsibility model
-description: YugabyteDB Managed security shared responsibility model.
-image: /images/section_icons/index/secure.png
+description: Explore the the security shared responsiblity model of the YugabyteDB Managed database.
 menu:
   preview_yugabyte-cloud:
     parent: cloud-security

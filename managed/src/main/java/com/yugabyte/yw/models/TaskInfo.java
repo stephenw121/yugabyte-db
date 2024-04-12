@@ -10,22 +10,29 @@ import static play.mvc.Http.Status.BAD_REQUEST;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.collect.Sets;
+import com.yugabyte.yw.commissioner.TaskExecutor.TaskCache;
 import com.yugabyte.yw.commissioner.UserTaskDetails;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskDetails;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
 import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.models.helpers.TaskDetails;
+import com.yugabyte.yw.models.helpers.TaskDetails.TaskError;
 import com.yugabyte.yw.models.helpers.TaskType;
 import io.ebean.ExpressionList;
 import io.ebean.FetchGroup;
 import io.ebean.Finder;
 import io.ebean.Model;
-import io.ebean.Query;
-import io.ebean.annotation.CreatedTimestamp;
 import io.ebean.annotation.DbJson;
 import io.ebean.annotation.EnumValue;
-import io.ebean.annotation.UpdatedTimestamp;
+import io.ebean.annotation.WhenCreated;
+import io.ebean.annotation.WhenModified;
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.Id;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Date;
@@ -33,18 +40,19 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
-import javax.persistence.Column;
-import javax.persistence.Entity;
-import javax.persistence.EnumType;
-import javax.persistence.Enumerated;
-import javax.persistence.Id;
-import org.apache.commons.collections.CollectionUtils;
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.Setter;
+import org.apache.commons.collections4.CollectionUtils;
 import play.data.validation.Constraints;
 
 @Entity
 @ApiModel(description = "Task information")
+@Getter
+@Setter
 public class TaskInfo extends Model {
 
   private static final FetchGroup<TaskInfo> GET_SUBTASKS_FG =
@@ -61,28 +69,39 @@ public class TaskInfo extends Model {
   /** These are the various states of the task and taskgroup. */
   public enum State {
     @EnumValue("Created")
-    Created,
+    Created(3),
 
     @EnumValue("Initializing")
-    Initializing,
+    Initializing(1),
 
     @EnumValue("Running")
-    Running,
+    Running(4),
 
     @EnumValue("Success")
-    Success,
+    Success(2),
 
     @EnumValue("Failure")
-    Failure,
+    Failure(7),
 
     @EnumValue("Unknown")
-    Unknown,
+    Unknown(0),
 
     @EnumValue("Abort")
-    Abort,
+    Abort(5),
 
     @EnumValue("Aborted")
-    Aborted
+    Aborted(6);
+
+    // State override precedence to report the aggregated state for a SubGroupType.
+    private final int precedence;
+
+    private State(int precedence) {
+      this.precedence = precedence;
+    }
+
+    public int getPrecedence() {
+      return precedence;
+    }
   }
 
   // The task UUID.
@@ -119,12 +138,12 @@ public class TaskInfo extends Model {
   private UserTaskDetails.SubTaskGroupType subTaskGroupType;
 
   // The task creation time.
-  @CreatedTimestamp
+  @WhenCreated
   @ApiModelProperty(value = "Creation time", accessMode = READ_ONLY, example = "1624295239113")
   private Date createTime;
 
   // The task update time. Time of the latest update (including heartbeat updates) on this task.
-  @UpdatedTimestamp
+  @WhenModified
   @ApiModelProperty(value = "Updated time", accessMode = READ_ONLY, example = "1624295239113")
   private Date updateTime;
 
@@ -133,13 +152,20 @@ public class TaskInfo extends Model {
   @ApiModelProperty(value = "Percentage complete", accessMode = READ_ONLY)
   private Integer percentDone = 0;
 
-  // Details of the task, usually a JSON representation of the incoming task. This is used to
-  // describe the details of the task that is being executed.
+  // Task input parameters.
   @Constraints.Required
   @Column(columnDefinition = "TEXT default '{}'", nullable = false)
   @DbJson
-  @ApiModelProperty(value = "Task details", accessMode = READ_ONLY, required = true)
-  private JsonNode details;
+  @ApiModelProperty(value = "Task params", accessMode = READ_ONLY, required = true)
+  private JsonNode taskParams;
+
+  // Execution or runtime details of the task.
+  @Setter(AccessLevel.NONE)
+  @Constraints.Required
+  @Column(columnDefinition = "TEXT")
+  @DbJson
+  @ApiModelProperty(value = "Task details", accessMode = READ_ONLY)
+  private TaskDetails details;
 
   // Identifier of the process owning the task.
   @Constraints.Required
@@ -150,49 +176,38 @@ public class TaskInfo extends Model {
       required = true)
   private String owner;
 
-  public TaskInfo(TaskType taskType) {
+  public TaskInfo(TaskType taskType, UUID taskUUID) {
     this.taskType = taskType;
-  }
-
-  public Date getCreationTime() {
-    return createTime;
-  }
-
-  public Date getLastUpdateTime() {
-    return updateTime;
-  }
-
-  public UUID getParentUUID() {
-    return parentUuid;
-  }
-
-  public int getPercentDone() {
-    return percentDone;
-  }
-
-  public int getPosition() {
-    return position;
-  }
-
-  public UserTaskDetails.SubTaskGroupType getSubTaskGroupType() {
-    return subTaskGroupType;
-  }
-
-  @JsonIgnore
-  public JsonNode getTaskDetails() {
-    return details;
+    this.uuid = taskUUID;
   }
 
   @JsonIgnore
   public String getErrorMessage() {
-    if (details == null || taskState == State.Success) {
+    TaskError error = getTaskError();
+    if (error != null) {
+      return error.getMessage();
+    }
+    return null;
+  }
+
+  @JsonIgnore
+  public synchronized TaskError getTaskError() {
+    if (taskState == State.Success || details == null) {
       return null;
     }
-    JsonNode node = details.get("errorString");
-    if (node == null || node.isNull()) {
+    TaskError error = details.getError();
+    if (error == null || error.getCode() == null) {
       return null;
     }
-    return node.asText();
+    return error;
+  }
+
+  @JsonIgnore
+  public synchronized void setTaskError(TaskError error) {
+    if (details == null) {
+      details = new TaskDetails();
+    }
+    details.setError(error);
   }
 
   public State getTaskState() {
@@ -215,40 +230,16 @@ public class TaskInfo extends Model {
     uuid = taskUUID;
   }
 
-  public void setOwner(String owner) {
-    this.owner = owner;
-  }
-
-  public void setParentUuid(UUID parentUuid) {
-    this.parentUuid = parentUuid;
-  }
-
-  public void setPercentDone(int percentDone) {
-    this.percentDone = percentDone;
-  }
-
-  public void setPosition(int position) {
-    this.position = position;
-  }
-
-  public void setSubTaskGroupType(UserTaskDetails.SubTaskGroupType subTaskGroupType) {
-    this.subTaskGroupType = subTaskGroupType;
-  }
-
-  public void setTaskState(State taskState) {
-    this.taskState = taskState;
-  }
-
-  public void setTaskDetails(JsonNode details) {
-    this.details = details;
-  }
-
   public static final Finder<UUID, TaskInfo> find = new Finder<UUID, TaskInfo>(TaskInfo.class) {};
 
   @Deprecated
   public static TaskInfo get(UUID taskUUID) {
     // Return the instance details object.
     return find.byId(taskUUID);
+  }
+
+  public static Optional<TaskInfo> maybeGet(UUID taskUUID) {
+    return Optional.ofNullable(get(taskUUID));
   }
 
   public static TaskInfo getOrBadRequest(UUID taskUUID) {
@@ -270,9 +261,18 @@ public class TaskInfo extends Model {
     return query.findList();
   }
 
+  public static List<TaskInfo> getLatestIncompleteBackupTask() {
+    return find.query()
+        .where()
+        .eq("task_type", TaskType.CreateBackup)
+        .notIn("task_state", COMPLETED_STATES)
+        .orderBy("create_time desc")
+        .findList();
+  }
+
   // Returns  partial object
   public List<TaskInfo> getSubTasks() {
-    Query<TaskInfo> subTaskQuery =
+    ExpressionList<TaskInfo> subTaskQuery =
         TaskInfo.find
             .query()
             .select(GET_SUBTASKS_FG)
@@ -301,45 +301,61 @@ public class TaskInfo extends Model {
     return sb.toString();
   }
 
+  public UserTaskDetails getUserTaskDetails() {
+    return getUserTaskDetails(null);
+  }
+
   /**
    * Retrieve the UserTaskDetails for the task mapped to this TaskInfo object. Should only be called
    * on the user-level parent task, since only that task will have subtasks. Nothing will break if
-   * called on a SubTask, it just won't give you much useful information.
+   * called on a SubTask, it just won't give you much useful information. Some subtask group types
+   * are repeated later in the task that must be fixed. So, a subTask group cannot be marked
+   * Success.
    *
    * @return UserTaskDetails object for this TaskInfo, including info on the state on each of the
    *     subTaskGroups.
    */
-  public UserTaskDetails getUserTaskDetails() {
+  public UserTaskDetails getUserTaskDetails(TaskCache taskCache) {
     UserTaskDetails taskDetails = new UserTaskDetails();
     List<TaskInfo> result = getSubTasks();
     Map<SubTaskGroupType, SubTaskDetails> userTasksMap = new HashMap<>();
-    boolean customerTaskFailure = TaskInfo.ERROR_STATES.contains(taskState);
+    SubTaskGroupType lastGroupType = SubTaskGroupType.Invalid;
     for (TaskInfo taskInfo : result) {
       SubTaskGroupType subTaskGroupType = taskInfo.getSubTaskGroupType();
       if (subTaskGroupType == SubTaskGroupType.Invalid) {
         continue;
       }
-      SubTaskDetails subTask = userTasksMap.get(subTaskGroupType);
+      SubTaskDetails subTask = null;
+      if (userTasksMap.containsKey(subTaskGroupType)) {
+        // The type is already seen, group it with the last task if it is present.
+        // This is done not to move back the progress for the group type on the UI
+        // if the type shows up later.
+        subTask =
+            lastGroupType == SubTaskGroupType.Invalid
+                ? userTasksMap.get(subTaskGroupType)
+                : userTasksMap.get(lastGroupType);
+      }
       if (subTask == null) {
         subTask = createSubTask(subTaskGroupType);
         taskDetails.add(subTask);
-      } else {
-        if (TaskInfo.ERROR_STATES.contains(subTask.getState())) {
-          // If error is set, report the error.
-          continue;
-        }
-        if (State.Running.equals(subTask.getState())) {
-          // If no error but at least one them is running, report running.
-          continue;
-        }
+        userTasksMap.put(subTaskGroupType, subTask);
+        // Move only when it is new.
+        // This works for patterns like A B A B C.
+        lastGroupType = subTaskGroupType;
       }
-      State subTaskState = taskInfo.getTaskState();
-      if (State.Created.equals(subTaskState)) {
-        subTask.setState(customerTaskFailure ? State.Unknown : State.Created);
-      } else if (!State.Success.equals(subTaskState)) {
-        subTask.setState(subTaskState);
+      if (taskCache != null) {
+        // Populate extra details about task progress from Task Cache.
+        JsonNode cacheData = taskCache.get(taskInfo.getTaskUUID().toString());
+        subTask.populateDetails(cacheData);
       }
-      userTasksMap.put(subTaskGroupType, subTask);
+      if (subTask.getState().getPrecedence() < taskInfo.getTaskState().getPrecedence()) {
+        State overrideState = taskInfo.getTaskState();
+        if (subTask.getState() == State.Success && taskInfo.getTaskState() == State.Created) {
+          // SubTask was already running, so skip to running to fix this very short transition.
+          overrideState = State.Running;
+        }
+        subTask.setState(overrideState);
+      }
     }
     return taskDetails;
   }
@@ -352,7 +368,7 @@ public class TaskInfo extends Model {
   public double getPercentCompleted() {
     int numSubtasks = TaskInfo.find.query().where().eq("parent_uuid", getTaskUUID()).findCount();
     if (numSubtasks == 0) {
-      if (TaskInfo.COMPLETED_STATES.contains(getTaskState())) {
+      if (getTaskState() == TaskInfo.State.Success) {
         return 100.0;
       }
       return 0.0;

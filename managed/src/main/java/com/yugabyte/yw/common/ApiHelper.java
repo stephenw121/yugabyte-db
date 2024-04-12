@@ -2,8 +2,8 @@
 
 package com.yugabyte.yw.common;
 
-import akka.stream.javadsl.Source;
-import akka.util.ByteString;
+import static play.mvc.Http.Status.INTERNAL_SERVER_ERROR;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.annotations.VisibleForTesting;
@@ -12,14 +12,13 @@ import com.google.inject.Singleton;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.time.Duration;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.pekko.stream.javadsl.Source;
+import org.apache.pekko.util.ByteString;
 import play.libs.Json;
 import play.libs.ws.WSClient;
 import play.libs.ws.WSRequest;
@@ -42,9 +41,18 @@ public class ApiHelper {
   }
 
   public boolean postRequest(String url) {
+    return postRequest(url, Collections.emptyMap());
+  }
+
+  public boolean postRequest(String url, Map<String, String> headers) {
     try {
-      return wsClient
-          .url(url)
+      WSRequest request = wsClient.url(url);
+      if (!headers.isEmpty()) {
+        for (Map.Entry<String, String> entry : headers.entrySet()) {
+          request.addHeader(entry.getKey(), entry.getValue());
+        }
+      }
+      return request
           .execute("POST")
           .thenApply(wsResponse -> wsResponse.getStatus() == 200)
           .toCompletableFuture()
@@ -81,14 +89,19 @@ public class ApiHelper {
 
   // Helper function to get the full body of the webpage via an http request to the given url.
   public String getBody(String url) {
-    WSRequest request = wsClient.url(url);
-    request.setRequestTimeout(DEFAULT_GET_REQUEST_TIMEOUT);
+    return getBody(url, new HashMap<>(), DEFAULT_GET_REQUEST_TIMEOUT);
+  }
+
+  public String getBody(String url, Map<String, String> headers, Duration timeout) {
+    WSRequest request = requestWithHeaders(url, headers);
+    request.setRequestTimeout(timeout);
     CompletionStage<String> jsonPromise = request.get().thenApply(WSResponse::getBody);
     String pageText = null;
     try {
       pageText = jsonPromise.toCompletableFuture().get();
-    } catch (InterruptedException | ExecutionException e) {
+    } catch (Exception e) {
       pageText = e.getMessage();
+      e.printStackTrace();
     }
     return pageText;
   }
@@ -120,6 +133,7 @@ public class ApiHelper {
 
   public JsonNode getRequest(String url, Map<String, String> headers, Map<String, String> params) {
     WSRequest request = requestWithHeaders(url, headers);
+    request.setFollowRedirects(true);
     if (!params.isEmpty()) {
       for (Map.Entry<String, String> entry : params.entrySet()) {
         request.setQueryParameter(entry.getKey(), entry.getValue());
@@ -146,7 +160,7 @@ public class ApiHelper {
     WSRequest request = wsClient.url(url);
     if (!headers.isEmpty()) {
       for (Map.Entry<String, String> entry : headers.entrySet()) {
-        request.setHeader(entry.getKey(), entry.getValue());
+        request.addHeader(entry.getKey(), entry.getValue());
       }
     }
     return request;
@@ -189,6 +203,15 @@ public class ApiHelper {
     headers.forEach(request::addHeader);
     CompletionStage<String> post =
         request.post(Source.from(partsList)).thenApply(WSResponse::getBody);
-    return handleJSONPromise(post);
+    try {
+      return handleJSONPromise(post);
+    } catch (RuntimeException e) {
+      return new PlatformServiceException(INTERNAL_SERVER_ERROR, e.getMessage()).getContentJson();
+    }
+  }
+
+  public CompletionStage<WSResponse> getSimpleRequest(String url, Map<String, String> headers) {
+    WSRequest request = requestWithHeaders(url, headers).setFollowRedirects(true);
+    return request.get();
   }
 }

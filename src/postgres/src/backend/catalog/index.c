@@ -80,8 +80,10 @@
 #include "utils/tqual.h"
 
 /*  YB includes. */
+#include "commands/progress.h"
 #include "commands/ybccmds.h"
 #include "pg_yb_utils.h"
+#include "pgstat.h"
 
 /* Potentially set by pg_upgrade_support functions */
 Oid			binary_upgrade_next_index_pg_class_oid = InvalidOid;
@@ -206,6 +208,20 @@ relationHasPrimaryKey(Relation rel)
 	list_free(indexoidlist);
 
 	return result;
+}
+
+/*
+ * YBRelationHasPrimaryKey
+ *		See whether an existing relation has a primary key.
+ *
+ * Caller must have suitable lock on the relation.
+ *
+ * Note: It is just a wrapper over the relationHasPrimaryKey function above.
+ */
+bool
+YBRelationHasPrimaryKey(Relation rel)
+{
+	return relationHasPrimaryKey(rel);
 }
 
 /*
@@ -789,6 +805,7 @@ index_create(Relation heapRelation,
 			 Oid *constraintId,
 			 OptSplit *split_options,
 			 const bool skip_index_backfill,
+			 bool is_colocated,
 			 Oid tablegroupId,
 			 Oid colocationId)
 {
@@ -1003,9 +1020,12 @@ index_create(Relation heapRelation,
 					   heapRelation,
 					   split_options,
 					   skip_index_backfill,
+					   is_colocated,
 					   tablegroupId,
 					   colocationId,
-					   tableSpaceId);
+					   tableSpaceId,
+					   InvalidOid /* pgTableId */,
+					   InvalidOid /* oldRelfileNodeId */);
 	}
 
 	/*
@@ -1128,7 +1148,7 @@ index_create(Relation heapRelation,
 
 		if (IsYBRelation(heapRelation) && IsCatalogRelation(heapRelation))
 		{
-			YBRecordPinDependency(&myself, shared_relation);
+			YbRecordPinDependency(&myself, shared_relation);
 		}
 		else
 		{
@@ -1312,6 +1332,11 @@ index_create(Relation heapRelation,
 	}
 	else
 	{
+		if (IsYugaByteEnabled() && !concurrent && !invalid &&
+			yb_test_block_index_phase[0] != '\0')
+			YbTestGucBlockWhileStrEqual(&yb_test_block_index_phase,
+										"backfill",
+										"non-concurrent index backfill");
 		index_build(heapRelation, indexRelation, indexInfo, isprimary, false,
 					true);
 	}
@@ -1321,6 +1346,13 @@ index_create(Relation heapRelation,
 	 * of transaction.  Closing the heap is caller's responsibility.
 	 */
 	index_close(indexRelation, NoLock);
+
+	if (IsYugaByteEnabled() && !concurrent && !invalid &&
+		yb_test_block_index_phase[0] != '\0')
+		YbTestGucBlockWhileStrEqual(&yb_test_block_index_phase,
+									"postbackfill",
+									"operations after a non-concurrent "
+									"index backfill");
 
 	return indexRelationId;
 }
@@ -2415,6 +2447,10 @@ index_build(Relation heapRelation,
 						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
 	save_nestlevel = NewGUCNestLevel();
 
+	if (IsYugaByteEnabled())
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_PHASE,
+									 YB_PROGRESS_CREATEIDX_BACKFILLING);
+
 	/*
 	 * Call the access method's build procedure
 	 */
@@ -2494,11 +2530,24 @@ index_build(Relation heapRelation,
 	}
 
 	/*
-	 * Update heap and index pg_class rows
+	 * Sanity check to ensure concurrent index builds don't reach this
+	 * code-path. In YB, we don't compute stats during a concurrent index build
+	 * so we shouldn't update them here.
 	 */
+	if (IsYugaByteEnabled())
+		Assert(!indexInfo->ii_Concurrent);
+
+	/*
+	 * Update heap and index pg_class rows
+	 *
+	 * YB TODO(fizaa): Properly update reltuples for the indexed table
+	 * (see GH #16506). Currently, we don't compute this statistic during a
+	 * non-concurrent index build so we should not update it here.
+	 */
+
 	index_update_stats(heapRelation,
 					   true,
-					   stats->heap_tuples);
+					   IsYBRelation(heapRelation) ? -1 : stats->heap_tuples);
 
 	index_update_stats(indexRelation,
 					   false,
@@ -2732,6 +2781,7 @@ IndexBuildHeapRangeScanInternal(Relation heapRelation,
 	BlockNumber root_blkno = InvalidBlockNumber;
 	OffsetNumber root_offsets[MaxHeapTuplesPerPage];
 	MemoryContext oldcontext = GetCurrentMemoryContext();
+	int			yb_tuples_done = 0;
 
 	/*
 	 * sanity checks
@@ -3144,6 +3194,7 @@ IndexBuildHeapRangeScanInternal(Relation heapRelation,
 		{
 			/* In YugaByte mode DocDB will only send live tuples. */
 			tupleIsAlive = true;
+			reltuples += 1;
 		}
 
 		if (!IsYBRelation(indexRelation))
@@ -3159,7 +3210,12 @@ IndexBuildHeapRangeScanInternal(Relation heapRelation,
 		if (predicate != NULL)
 		{
 			if (!ExecQual(predicate, econtext))
+			{
+				if (IsYBRelation(indexRelation) && !indexInfo->ii_Concurrent)
+					pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE,
+												 ++yb_tuples_done);
 				continue;
+			}
 		}
 
 		/*
@@ -3215,7 +3271,12 @@ IndexBuildHeapRangeScanInternal(Relation heapRelation,
 		}
 
 		if (IsYBRelation(indexRelation))
+		{
 			MemoryContextReset(econtext->ecxt_per_tuple_memory);
+			if (!indexInfo->ii_Concurrent)
+				pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE,
+											 ++yb_tuples_done);
+		}
 	}
 
 	if (IsYBRelation(indexRelation))
@@ -3954,7 +4015,8 @@ IndexGetRelation(Oid indexId, bool missing_ok)
  */
 void
 reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
-			  int options)
+			  int options, bool is_yb_table_rewrite,
+			  bool yb_copy_split_options)
 {
 	Relation	iRel,
 				heapRelation;
@@ -4010,9 +4072,11 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 
 	/*
 	 * YB pk indexes share the same storage as their tables, so it is not
-	 * possible to reindex them.
+	 * possible to reindex them. However, this code-path may be internally
+	 * invoked by table rewrite, and we need to reset the index's reltuples.
 	 */
-	if (iRel->rd_index->indisprimary && IsYBRelation(iRel))
+	if (!is_yb_table_rewrite && iRel->rd_index->indisprimary &&
+		IsYBRelation(iRel))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot reindex nontemporary pk indexes"),
@@ -4043,8 +4107,12 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 	 *
 	 * indisvalid and indisready should be true for best chance of avoiding
 	 * corruption.
+	 *
+	 * NOTE: reindex is permitted internally on public indexes when the indexed
+	 * table is being rewritten.
 	 */
-	if (IndexIsValid(iRel->rd_index) && IsYBRelation(iRel))
+	if (!is_yb_table_rewrite && IndexIsValid(iRel->rd_index)
+		&& IsYBRelation(iRel))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot reindex public indexes"),
@@ -4084,13 +4152,14 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 			indexInfo->ii_ExclusionStrats = NULL;
 		}
 
-		if (IsYBRelation(heapRelation))
+		if (IsYugaByteEnabled() && IsSystemRelation(heapRelation))
 			YbTruncate(iRel);
 		else
 		{
 			/* We'll build a new physical relation for the index */
 			RelationSetNewRelfilenode(iRel, persistence, InvalidTransactionId,
-									  InvalidMultiXactId);
+									  InvalidMultiXactId,
+									  yb_copy_split_options);
 		}
 
 		/* Initialize the index and rebuild */
@@ -4239,7 +4308,8 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
  * index rebuild.
  */
 bool
-reindex_relation(Oid relid, int flags, int options)
+reindex_relation(Oid relid, int flags, int options, bool is_yb_table_rewrite,
+				 bool yb_copy_split_options)
 {
 	Relation	rel;
 	Oid			toast_relid;
@@ -4341,34 +4411,29 @@ reindex_relation(Oid relid, int flags, int options)
 		foreach(indexId, indexIds)
 		{
 			Oid			indexOid = lfirst_oid(indexId);
-
-			if (IsYBRelation(rel) &&
-			    rel->rd_rel->relkind == RELKIND_MATVIEW &&
-			    (flags & REINDEX_REL_SUPPRESS_INDEX_USE))
+			Relation iRel = index_open(indexOid, AccessExclusiveLock);
+			if (is_pg_class)
+				RelationSetIndexList(rel, doneIndexes, InvalidOid);
+			if (IsYBRelation(iRel))
 			{
-				/*
-				 * This code path is invoked during REFRESH MATERIALIZED VIEW
-				 * when we swap the target and transient tables. A reindex will
-				 * not work because the indexes' DocDB metadata will still be
-				 * pointing to the old table, which will be dropped.
-				 */
-
-				Relation new_rel = heap_open(YbGetStorageRelid(rel), AccessExclusiveLock);
-				AttrNumber *new_to_old_attmap = convert_tuples_by_name_map(RelationGetDescr(new_rel),
-											  	RelationGetDescr(rel),
-											  	gettext_noop("could not convert row type"));
-				heap_close(new_rel, AccessExclusiveLock);
-				YbDropAndRecreateIndex(indexOid, relid, rel, new_to_old_attmap);
-				RemoveReindexPending(indexOid);
+				if (!is_yb_table_rewrite && !iRel->rd_index->indisprimary)
+					/*
+					* Drop the old DocDB table associated with this index.
+					* This is only required for secondary indexes, because a
+					* primary index in YB doesn't have a DocDB table separate
+					* from the base relation's table.
+					* If this is a table rewrite, the indexes on the table
+					* will automatically be dropped when the table is dropped.
+					* Note: The drop isn't finalized until after the txn
+					* commits/aborts.
+					*/
+					YBCDropIndex(iRel);
 			}
-			else
-			{
-				if (is_pg_class)
-					RelationSetIndexList(rel, doneIndexes, InvalidOid);
-
-				reindex_index(indexOid, !(flags & REINDEX_REL_CHECK_CONSTRAINTS),
-							  persistence, options);
-			}
+			index_close(iRel, AccessExclusiveLock);
+			reindex_index(indexOid,
+							!(flags & REINDEX_REL_CHECK_CONSTRAINTS),
+							persistence, options, is_yb_table_rewrite,
+							yb_copy_split_options);
 
 			CommandCounterIncrement();
 
@@ -4403,7 +4468,9 @@ reindex_relation(Oid relid, int flags, int options)
 	 * still hold the lock on the master table.
 	 */
 	if ((flags & REINDEX_REL_PROCESS_TOAST) && OidIsValid(toast_relid))
-		result |= reindex_relation(toast_relid, flags, options);
+		result |= reindex_relation(toast_relid, flags, options,
+								   false /* is_yb_table_rewrite */,
+								   yb_copy_split_options);
 
 	return result;
 }

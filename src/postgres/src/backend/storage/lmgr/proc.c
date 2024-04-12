@@ -66,6 +66,7 @@ bool		log_lock_waits = false;
 int			RetryMaxBackoffMsecs;
 int			RetryMinBackoffMsecs;
 double		RetryBackoffMultiplier;
+int yb_max_query_layer_retries;
 
 /* Pointer to this process's PGPROC and PGXACT structs, if any */
 PGPROC	   *MyProc = NULL;
@@ -84,6 +85,8 @@ NON_EXEC_STATIC slock_t *ProcStructLock = NULL;
 PROC_HDR   *ProcGlobal = NULL;
 NON_EXEC_STATIC PGPROC *AuxiliaryProcs = NULL;
 PGPROC	   *PreparedXactProcs = NULL;
+PGPROC	   *KilledProcToClean = NULL;
+int *yb_too_many_conn = NULL;
 
 /* If we are waiting for a lock, this points to the associated LOCALLOCK */
 static LOCALLOCK *lockAwaited = NULL;
@@ -120,6 +123,9 @@ ProcGlobalShmemSize(void)
 	size = add_size(size, mul_size(MaxBackends, sizeof(PGXACT)));
 	size = add_size(size, mul_size(NUM_AUXILIARY_PROCS, sizeof(PGXACT)));
 	size = add_size(size, mul_size(max_prepared_xacts, sizeof(PGXACT)));
+
+	/* yb_too_many_conn metric */
+	size = add_size(size, sizeof(int));
 
 	return size;
 }
@@ -231,6 +237,7 @@ InitProcGlobal(void)
 			procs[i].sem = PGSemaphoreCreate();
 			InitSharedLatch(&(procs[i].procLatch));
 			LWLockInitialize(&(procs[i].backendLock), LWTRANCHE_PROC);
+			LWLockInitialize(&(procs[i].yb_ash_metadata_lock), LWTRANCHE_YB_ASH_METADATA);
 		}
 		procs[i].pgprocno = i;
 
@@ -289,6 +296,9 @@ InitProcGlobal(void)
 	/* Create ProcStructLock spinlock, too */
 	ProcStructLock = (slock_t *) ShmemAlloc(sizeof(slock_t));
 	SpinLockInit(ProcStructLock);
+
+	yb_too_many_conn = (int *) ShmemAlloc(sizeof(int));
+	(*yb_too_many_conn) = 0;
 }
 
 /*
@@ -344,6 +354,8 @@ InitProcess(void)
 		 * in the autovacuum case?
 		 */
 		SpinLockRelease(ProcStructLock);
+		/* increment rejection counter */
+		(*yb_too_many_conn)++;
 		ereport(FATAL,
 				(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
 				 errmsg("sorry, too many clients already")));
@@ -364,6 +376,15 @@ InitProcess(void)
 	 */
 	if (IsUnderPostmaster && !IsAutoVacuumLauncherProcess())
 		MarkPostmasterChildActive();
+
+	/*
+	* If the process is killed before this point, it does not have a pid set.
+	* The postmaster will not be able to identify the corresponding MyProc, so
+	* it will restart anyways.
+	*/
+	MyProc->ybInitializationCompleted = false;
+	MyProc->ybTerminationStarted = false;
+	MyProc->ybEnteredCriticalSection = false;
 
 	/*
 	 * Initialize all fields of MyProc, except for those previously
@@ -428,7 +449,17 @@ InitProcess(void)
 	MyProc->clogGroupMemberLsn = InvalidXLogRecPtr;
 	Assert(pg_atomic_read_u32(&MyProc->clogGroupNext) == INVALID_PGPROCNO);
 
-	MyProc->ybAnyLockAcquired = false;
+	MyProc->ybLWLockAcquired = false;
+	MyProc->ybSpinLocksAcquired = 0;
+
+	MemSet(MyProc->yb_ash_metadata.root_request_id, 0,
+		   sizeof(MyProc->yb_ash_metadata.root_request_id));
+	MyProc->yb_ash_metadata.query_id = 0;
+	MemSet(MyProc->yb_ash_metadata.client_addr, 0,
+		   sizeof(MyProc->yb_ash_metadata.client_addr));
+	MyProc->yb_ash_metadata.client_port = 0;
+	MyProc->yb_ash_metadata.addr_family = AF_UNSPEC;
+	MyProc->yb_is_ash_metadata_set = false;
 
 	/*
 	 * Acquire ownership of the PGPROC's latch, so that we can use WaitLatch
@@ -573,6 +604,7 @@ InitAuxiliaryProcess(void)
 	MyProc->lwWaitMode = 0;
 	MyProc->waitLock = NULL;
 	MyProc->waitProcLock = NULL;
+	MyProc->yb_is_ash_metadata_set = false;
 #ifdef USE_ASSERT_CHECKING
 	{
 		int			i;
@@ -799,17 +831,23 @@ RemoveProcFromArray(int code, Datum arg)
 /*
  * ProcKill() -- Destroy the per-proc data structure for
  *		this process. Release any of its held LW locks.
+ *
+ * If you are going to edit this, take a look at postmaster.c:reaper as well.
+ * That function handles as much as this as possible but from the perspective
+ * of the parent of the terminated child, to handle cases where the child was
+ * not able to clean itself up.
  */
 static void
 ProcKill(int code, Datum arg)
 {
 	PGPROC	   *proc;
-	PGPROC	   *volatile *procgloballist;
 
 	Assert(MyProc != NULL);
 
+	MyProc->ybTerminationStarted = true;
+
 	/* Make sure we're out of the sync rep lists */
-	SyncRepCleanupAtProcExit();
+	SyncRepCleanupAtProcExit(MyProc);
 
 #ifdef USE_ASSERT_CHECKING
 	{
@@ -838,38 +876,8 @@ ProcKill(int code, Datum arg)
 	/* Also cleanup all the temporary slots. */
 	ReplicationSlotCleanup();
 
-	/*
-	 * Detach from any lock group of which we are a member.  If the leader
-	 * exist before all other group members, it's PGPROC will remain allocated
-	 * until the last group process exits; that process must return the
-	 * leader's PGPROC to the appropriate list.
-	 */
 	if (MyProc->lockGroupLeader != NULL)
-	{
-		PGPROC	   *leader = MyProc->lockGroupLeader;
-		LWLock	   *leader_lwlock = LockHashPartitionLockByProc(leader);
-
-		LWLockAcquire(leader_lwlock, LW_EXCLUSIVE);
-		Assert(!dlist_is_empty(&leader->lockGroupMembers));
-		dlist_delete(&MyProc->lockGroupLink);
-		if (dlist_is_empty(&leader->lockGroupMembers))
-		{
-			leader->lockGroupLeader = NULL;
-			if (leader != MyProc)
-			{
-				procgloballist = leader->procgloballist;
-
-				/* Leader exited first; return its PGPROC. */
-				SpinLockAcquire(ProcStructLock);
-				leader->links.next = (SHM_QUEUE *) *procgloballist;
-				*procgloballist = leader;
-				SpinLockRelease(ProcStructLock);
-			}
-		}
-		else if (leader != MyProc)
-			MyProc->lockGroupLeader = NULL;
-		LWLockRelease(leader_lwlock);
-	}
+		RemoveLockGroupLeader(MyProc);
 
 	/*
 	 * Reset MyLatch to the process local one.  This is so that signal
@@ -882,7 +890,60 @@ ProcKill(int code, Datum arg)
 	MyProc = NULL;
 	DisownLatch(&proc->procLatch);
 
-	procgloballist = proc->procgloballist;
+	ReleaseProcToFreeList(proc);
+
+	/*
+	 * This process is no longer present in shared memory in any meaningful
+	 * way, so tell the postmaster we've cleaned up acceptably well. (XXX
+	 * autovac launcher should be included here someday)
+	 */
+	if (IsUnderPostmaster && !IsAutoVacuumLauncherProcess())
+		MarkPostmasterChildInactive();
+
+	/* wake autovac launcher if needed -- see comments in FreeWorkerInfo */
+	if (AutovacuumLauncherPid != 0)
+		kill(AutovacuumLauncherPid, SIGUSR2);
+}
+
+/*
+ * Detach from any lock group of which we are a member.  If the leader
+ * exits before all other group members, it's PGPROC will remain allocated
+ * until the last group process exits; that process must return the
+ * leader's PGPROC to the appropriate list.
+ */
+void
+RemoveLockGroupLeader(PGPROC *proc)
+{
+	PGPROC	   *volatile *procgloballist;
+	PGPROC	   *leader = proc->lockGroupLeader;
+	LWLock	   *leader_lwlock = LockHashPartitionLockByProc(leader);
+
+	LWLockAcquire(leader_lwlock, LW_EXCLUSIVE);
+	Assert(!dlist_is_empty(&leader->lockGroupMembers));
+	dlist_delete(&proc->lockGroupLink);
+	if (dlist_is_empty(&leader->lockGroupMembers))
+	{
+		leader->lockGroupLeader = NULL;
+		if (leader != proc)
+		{
+			procgloballist = leader->procgloballist;
+
+			/* Leader exited first; return its PGPROC. */
+			SpinLockAcquire(ProcStructLock);
+			leader->links.next = (SHM_QUEUE *) *procgloballist;
+			*procgloballist = leader;
+			SpinLockRelease(ProcStructLock);
+		}
+	}
+	else if (leader != proc)
+		proc->lockGroupLeader = NULL;
+	LWLockRelease(leader_lwlock);
+}
+
+void
+ReleaseProcToFreeList(PGPROC *proc)
+{
+	PGPROC	   *volatile *procgloballist = proc->procgloballist;
 	SpinLockAcquire(ProcStructLock);
 
 	/*
@@ -904,18 +965,6 @@ ProcKill(int code, Datum arg)
 	ProcGlobal->spins_per_delay = update_spins_per_delay(ProcGlobal->spins_per_delay);
 
 	SpinLockRelease(ProcStructLock);
-
-	/*
-	 * This process is no longer present in shared memory in any meaningful
-	 * way, so tell the postmaster we've cleaned up acceptably well. (XXX
-	 * autovac launcher should be included here someday)
-	 */
-	if (IsUnderPostmaster && !IsAutoVacuumLauncherProcess())
-		MarkPostmasterChildInactive();
-
-	/* wake autovac launcher if needed -- see comments in FreeWorkerInfo */
-	if (AutovacuumLauncherPid != 0)
-		kill(AutovacuumLauncherPid, SIGUSR2);
 }
 
 /*

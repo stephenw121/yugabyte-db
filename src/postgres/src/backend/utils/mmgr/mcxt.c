@@ -21,12 +21,29 @@
 
 #include "postgres.h"
 
+#include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "utils/builtins.h"
+#include "storage/proc.h"
+#include "storage/procarray.h"
+#include "storage/procsignal.h"
+#include "utils/fmgrprotos.h"
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
-#include "yb/yql/pggate/ybc_pggate.h"
+
+/* YB includes */
+#include "pgstat.h"
 #include "pg_yb_utils.h"
+#include "commands/explain.h"
+#include "yb/yql/pggate/ybc_pggate.h"
+
+#ifdef __linux__
+#include <stdio.h>
+#include <unistd.h>
+#else
+#include <libproc.h>
+#endif
 
 YbPgMemTracker PgMemTracker = {0};
 
@@ -41,9 +58,9 @@ YbPgMemTracker PgMemTracker = {0};
  * during an execution.
  */
 static Size
-SnapshotMemory()
+YbSnapshotMemory()
 {
-#ifdef TCMALLOC_ENABLED
+#if YB_TCMALLOC_ENABLED
 	int64_t cur_tc_actual_sz = 0;
 	YBCGetPgggateCurrentAllocatedBytes(&cur_tc_actual_sz);
 	return cur_tc_actual_sz;
@@ -52,20 +69,74 @@ SnapshotMemory()
 #endif
 }
 
-void
+/*
+ * Update current memory usage in MemTracker, when there is no PG
+ * memory allocation activities.
+ */
+static void
 YbPgMemUpdateMax()
 {
-	const Size snapshot_mem = SnapshotMemory();
-	PgMemTracker.backend_max_mem_bytes =
-		Max(PgMemTracker.backend_max_mem_bytes, snapshot_mem);
+	const Size snapshot_mem = YbSnapshotMemory();
 	PgMemTracker.stmt_max_mem_bytes =
 		Max(PgMemTracker.stmt_max_mem_bytes,
 			snapshot_mem - PgMemTracker.stmt_max_mem_base_bytes);
 }
 
+/*
+ * Update the current actual heap memory usage in MemTracker by getting
+ * the value from the root MemTracker's consumption
+ */
+static void
+YbPgMemUpdateCur()
+{
+#if YB_TCMALLOC_ENABLED
+	YbGetActualHeapSizeBytes(&PgMemTracker.backend_cur_allocated_mem_bytes);
+	yb_pgstat_report_allocated_mem_bytes();
+#endif
+}
+
+int64_t
+YbPgGetCurRSSMemUsage(int pid)
+{
+	if (!yb_enable_memory_tracking)
+		return -1;
+#ifdef __linux__
+	uint64 resident = 0;
+	char path[20];
+	snprintf(path, 20, "/proc/%d/statm", pid);
+	FILE* fp = fopen(path, "r");
+
+	if (fp == NULL)
+		return -1; /* Can't open */
+
+	if (fscanf(fp, "%*s%lu", &resident) != 1)
+	{
+		fclose(fp);
+		return -1; /* Can't read */
+	}
+	fclose(fp);
+	return resident * sysconf(_SC_PAGESIZE);
+#else
+	struct proc_taskallinfo info;
+	int result = proc_pidinfo(pid, PROC_PIDTASKALLINFO, 0, &info,
+		sizeof(struct proc_taskallinfo));
+
+	if (result == 0 || result < sizeof(info))
+		return -1; /* Can't be determined or wrong value */
+
+	return info.ptinfo.pti_resident_size;
+#endif
+}
+
 void
 YbPgMemAddConsumption(Size sz)
 {
+	if (!yb_enable_memory_tracking)
+		return;
+
+	if (IsMultiThreadedMode())
+		return;
+
 	PgMemTracker.pg_cur_mem_bytes += sz;
 	/*
 	 * Try to track PG's memory consumption by the root MemTracker.
@@ -76,25 +147,40 @@ YbPgMemAddConsumption(Size sz)
 	PgMemTracker.pggate_alive = YBCTryMemConsume(
 		PgMemTracker.pggate_alive ? sz : PgMemTracker.pg_cur_mem_bytes);
 
-	/* Only update max memory when memory is increasing */
-	YbPgMemUpdateMax();
+	if (yb_run_with_explain_analyze)
+		/* Only update max memory when memory is increasing */
+		YbPgMemUpdateMax();
+
+	/* Update current heap memory usage */
+	YbPgMemUpdateCur();
 }
 
 void
 YbPgMemSubConsumption(Size sz)
 {
+	if (!yb_enable_memory_tracking)
+		return;
+
+	if (IsMultiThreadedMode())
+		return;
+
 	// Avoid overflow when subtracting sz.
-	PgMemTracker.pg_cur_mem_bytes = Max(PgMemTracker.pg_cur_mem_bytes - sz, 0);
+	PgMemTracker.pg_cur_mem_bytes = PgMemTracker.pg_cur_mem_bytes >= sz ?
+										PgMemTracker.pg_cur_mem_bytes - sz :
+										0;
 	// Only call release if pggate is alive, and update its liveness from the
 	// return value.
 	if (PgMemTracker.pggate_alive)
 		PgMemTracker.pggate_alive = YBCTryMemRelease(sz);
+
+	/* Update current heap memory usage */
+	YbPgMemUpdateCur();
 }
 
 void
 YbPgMemResetStmtConsumption()
 {
-	PgMemTracker.stmt_max_mem_base_bytes = SnapshotMemory();
+	PgMemTracker.stmt_max_mem_base_bytes = YbSnapshotMemory();
 	PgMemTracker.stmt_max_mem_bytes = 0;
 }
 
@@ -119,8 +205,9 @@ MemoryContext SetThreadLocalCurrentMemoryContext(MemoryContext memctx)
 	return (MemoryContext) YBCPgSetThreadLocalCurrentMemoryContext(memctx);
 }
 
-MemoryContext CreateThreadLocalCurrentMemoryContext(MemoryContext parent,
-													const char *name)
+MemoryContext
+CreateThreadLocalMemoryContext(MemoryContext parent,
+							   const char *name)
 {
 	return AllocSetContextCreateExtended(parent, name, ALLOCSET_START_SMALL_SIZES);
 }
@@ -167,10 +254,12 @@ MemoryContext PortalContext = NULL;
 
 static void MemoryContextCallResetCallbacks(MemoryContext context);
 static void MemoryContextStatsInternal(MemoryContext context, int level,
-						   bool print, int max_children,
-						   MemoryContextCounters *totals);
+									   bool print, int max_children,
+									   MemoryContextCounters *totals,
+									   bool print_to_stderr);
 static void MemoryContextStatsPrint(MemoryContext context, void *passthru,
-						const char *stats_string);
+									const char *stats_string,
+									bool print_to_stderr);
 
 /*
  * You should not do memory allocations within a critical section, because
@@ -179,6 +268,12 @@ static void MemoryContextStatsPrint(MemoryContext context, void *passthru,
  */
 #define AssertNotInCriticalSection(context) \
 	Assert(CritSectionCount == 0 || (context)->allowInCritSection)
+
+/* ----------
+ * The max bytes for showing identifiers of MemoryContext.
+ * ----------
+ */
+#define MEMORY_CONTEXT_IDENT_DISPLAY_SIZE	1024
 
 /*****************************************************************************
  *	  EXPORTED ROUTINES														 *
@@ -608,28 +703,52 @@ void
 MemoryContextStats(MemoryContext context)
 {
 	/* A hard-wired limit on the number of children is usually good enough */
-	MemoryContextStatsDetail(context, 100);
+	MemoryContextStatsDetail(context, 100, true);
 }
 
 /*
  * MemoryContextStatsDetail
  *
  * Entry point for use if you want to vary the number of child contexts shown.
+ *
+ * If print_to_stderr is true, print statistics about the memory contexts
+ * with fprintf(stderr), otherwise use ereport().
  */
 void
-MemoryContextStatsDetail(MemoryContext context, int max_children)
+MemoryContextStatsDetail(MemoryContext context, int max_children,
+						 bool print_to_stderr)
 {
 	MemoryContextCounters grand_totals;
 
 	memset(&grand_totals, 0, sizeof(grand_totals));
 
-	MemoryContextStatsInternal(context, 0, true, max_children, &grand_totals);
+	MemoryContextStatsInternal(context, 0, true, max_children, &grand_totals, print_to_stderr);
 
-	fprintf(stderr,
-			"Grand total: %zu bytes in %zd blocks; %zu free (%zd chunks); %zu used\n",
-			grand_totals.totalspace, grand_totals.nblocks,
-			grand_totals.freespace, grand_totals.freechunks,
-			grand_totals.totalspace - grand_totals.freespace);
+	if (print_to_stderr)
+		fprintf(stderr,
+				"Grand total: %zu bytes in %zd blocks; %zu free (%zd chunks); %zu used\n",
+				grand_totals.totalspace, grand_totals.nblocks,
+				grand_totals.freespace, grand_totals.freechunks,
+				grand_totals.totalspace - grand_totals.freespace);
+	else
+
+		/*
+		 * Use LOG_SERVER_ONLY to prevent the memory contexts from being sent
+		 * to the connected client.
+		 *
+		 * We don't buffer the information about all memory contexts in a
+		 * backend into StringInfo and log it as one message. Otherwise which
+		 * may require the buffer to be enlarged very much and lead to OOM
+		 * error since there can be a large number of memory contexts in a
+		 * backend. Instead, we log one message per memory context.
+		 */
+		ereport(LOG_SERVER_ONLY,
+				(errhidestmt(true),
+				 errhidecontext(true),
+				 errmsg_internal("Grand total: %zu bytes in %zd blocks; %zu free (%zd chunks); %zu used",
+								 grand_totals.totalspace, grand_totals.nblocks,
+								 grand_totals.freespace, grand_totals.freechunks,
+								 grand_totals.totalspace - grand_totals.freespace)));
 }
 
 /*
@@ -644,7 +763,7 @@ MemoryContextStatsUsage(MemoryContext context, int max_children)
 
 	memset(&grand_totals, 0, sizeof(grand_totals));
 
-	MemoryContextStatsInternal(context, 0, false, max_children, &grand_totals);
+	MemoryContextStatsInternal(context, 0, false, max_children, &grand_totals, true);
 
 	return (grand_totals.totalspace - grand_totals.freespace);
 }
@@ -659,7 +778,8 @@ MemoryContextStatsUsage(MemoryContext context, int max_children)
 static void
 MemoryContextStatsInternal(MemoryContext context, int level,
 						   bool print, int max_children,
-						   MemoryContextCounters *totals)
+						   MemoryContextCounters *totals,
+						   bool print_to_stderr)
 {
 	MemoryContextCounters local_totals;
 	MemoryContext child;
@@ -671,7 +791,7 @@ MemoryContextStatsInternal(MemoryContext context, int level,
 	context->methods->stats(context,
 							print ? MemoryContextStatsPrint : NULL,
 							(void *) &level,
-							totals);
+							totals, print_to_stderr);
 
 	/*
 	 * Examine children.  If there are more than max_children of them, we do
@@ -686,11 +806,13 @@ MemoryContextStatsInternal(MemoryContext context, int level,
 		if (ichild < max_children)
 			MemoryContextStatsInternal(child, level + 1,
 									   print, max_children,
-									   totals);
+									   totals,
+									   print_to_stderr);
 		else
 			MemoryContextStatsInternal(child, level + 1,
 									   false, max_children,
-									   &local_totals);
+									   &local_totals,
+									   print_to_stderr);
 	}
 
 	/* Deal with excess children */
@@ -698,18 +820,33 @@ MemoryContextStatsInternal(MemoryContext context, int level,
 	{
 		if (print)
 		{
-			int			i;
+			if (print_to_stderr)
+			{
+				int			i;
 
-			for (i = 0; i <= level; i++)
-				fprintf(stderr, "  ");
-			fprintf(stderr,
-					"%d more child contexts containing %zu total in %zd blocks; %zu free (%zd chunks); %zu used\n",
-					ichild - max_children,
-					local_totals.totalspace,
-					local_totals.nblocks,
-					local_totals.freespace,
-					local_totals.freechunks,
-					local_totals.totalspace - local_totals.freespace);
+				for (i = 0; i <= level; i++)
+					fprintf(stderr, "  ");
+				fprintf(stderr,
+						"%d more child contexts containing %zu total in %zd blocks; %zu free (%zd chunks); %zu used\n",
+						ichild - max_children,
+						local_totals.totalspace,
+						local_totals.nblocks,
+						local_totals.freespace,
+						local_totals.freechunks,
+						local_totals.totalspace - local_totals.freespace);
+			}
+			else
+				ereport(LOG_SERVER_ONLY,
+						(errhidestmt(true),
+						 errhidecontext(true),
+						 errmsg_internal("level: %d; %d more child contexts containing %zu total in %zd blocks; %zu free (%zd chunks); %zu used",
+										 level,
+										 ichild - max_children,
+										 local_totals.totalspace,
+										 local_totals.nblocks,
+										 local_totals.freespace,
+										 local_totals.freechunks,
+										 local_totals.totalspace - local_totals.freespace)));
 		}
 
 		if (totals)
@@ -731,11 +868,13 @@ MemoryContextStatsInternal(MemoryContext context, int level,
  */
 static void
 MemoryContextStatsPrint(MemoryContext context, void *passthru,
-						const char *stats_string)
+						const char *stats_string,
+						bool print_to_stderr)
 {
 	int			level = *(int *) passthru;
 	const char *name = context->name;
 	const char *ident = context->ident;
+	char		truncated_ident[110];
 	int			i;
 
 	/*
@@ -749,9 +888,8 @@ MemoryContextStatsPrint(MemoryContext context, void *passthru,
 		ident = NULL;
 	}
 
-	for (i = 0; i < level; i++)
-		fprintf(stderr, "  ");
-	fprintf(stderr, "%s: %s", name, stats_string);
+	truncated_ident[0] = '\0';
+
 	if (ident)
 	{
 		/*
@@ -763,24 +901,41 @@ MemoryContextStatsPrint(MemoryContext context, void *passthru,
 		int			idlen = strlen(ident);
 		bool		truncated = false;
 
+		strcpy(truncated_ident, ": ");
+		i = strlen(truncated_ident);
+
 		if (idlen > 100)
 		{
 			idlen = pg_mbcliplen(ident, idlen, 100);
 			truncated = true;
 		}
-		fprintf(stderr, ": ");
+
 		while (idlen-- > 0)
 		{
 			unsigned char c = *ident++;
 
 			if (c < ' ')
 				c = ' ';
-			fputc(c, stderr);
+			truncated_ident[i++] = c;
 		}
+		truncated_ident[i] = '\0';
+
 		if (truncated)
-			fprintf(stderr, "...");
+			strcat(truncated_ident, "...");
 	}
-	fputc('\n', stderr);
+
+	if (print_to_stderr)
+	{
+		for (i = 0; i < level; i++)
+			fprintf(stderr, "  ");
+		fprintf(stderr, "%s: %s%s\n", name, stats_string, truncated_ident);
+	}
+	else
+		ereport(LOG_SERVER_ONLY,
+				(errhidestmt(true),
+				 errhidecontext(true),
+				 errmsg_internal("level: %d; %s: %s%s",
+								 level, name, stats_string, truncated_ident)));
 }
 
 /*
@@ -1074,6 +1229,52 @@ MemoryContextAllocExtended(MemoryContext context, Size size, int flags)
 	return ret;
 }
 
+/*
+ * HandleLogMemoryContextInterrupt
+ *		Handle receipt of an interrupt indicating logging of memory
+ *		contexts.
+ *
+ * All the actual work is deferred to ProcessLogMemoryContextInterrupt(),
+ * because we cannot safely emit a log message inside the signal handler.
+ */
+void
+HandleLogMemoryContextInterrupt(void)
+{
+	InterruptPending = true;
+	LogMemoryContextPending = true;
+	/* latch will be set by procsignal_sigusr1_handler */
+}
+
+/*
+ * ProcessLogMemoryContextInterrupt
+ * 		Perform logging of memory contexts of this backend process.
+ *
+ * Any backend that participates in ProcSignal signaling must arrange
+ * to call this function if we see LogMemoryContextPending set.
+ * It is called from CHECK_FOR_INTERRUPTS(), which is enough because
+ * the target process for logging of memory contexts is a backend.
+ */
+void
+ProcessLogMemoryContextInterrupt(void)
+{
+	LogMemoryContextPending = false;
+
+	ereport(LOG,
+			(errmsg("logging memory contexts of PID %d", MyProcPid)));
+
+	/*
+	 * When a backend process is consuming huge memory, logging all its memory
+	 * contexts might overrun available disk space. To prevent this, we limit
+	 * the number of child contexts to log per parent to 100.
+	 *
+	 * As with MemoryContextStats(), we suppose that practical cases where the
+	 * dump gets long will typically be huge numbers of siblings under the
+	 * same parent context; while the additional debugging value from seeing
+	 * details about individual siblings beyond 100 will not be large.
+	 */
+	MemoryContextStatsDetail(TopMemoryContext, 100, false);
+}
+
 void *
 palloc(Size size)
 {
@@ -1348,6 +1549,192 @@ pchomp(const char *in)
 	while (n > 0 && in[n - 1] == '\n')
 		n--;
 	return pnstrdup(in, n);
+}
+
+/*
+ * PutMemoryContextsStatsTupleStore
+ *		One recursion level for pg_get_backend_memory_contexts.
+ */
+static void
+PutMemoryContextsStatsTupleStore(Tuplestorestate *tupstore,
+								TupleDesc tupdesc, MemoryContext context,
+								const char *parent, int level)
+{
+#define PG_GET_BACKEND_MEMORY_CONTEXTS_COLS	9
+
+	Datum		values[PG_GET_BACKEND_MEMORY_CONTEXTS_COLS];
+	bool		nulls[PG_GET_BACKEND_MEMORY_CONTEXTS_COLS];
+	MemoryContextCounters stat;
+	MemoryContext child;
+	const char *name;
+	const char *ident;
+
+	AssertArg(MemoryContextIsValid(context));
+
+	name = context->name;
+	ident = context->ident;
+
+	/*
+	 * To be consistent with logging output, we label dynahash contexts
+	 * with just the hash table name as with MemoryContextStatsPrint().
+	 */
+	if (ident && strcmp(name, "dynahash") == 0)
+	{
+		name = ident;
+		ident = NULL;
+	}
+
+	/* Examine the context itself */
+	memset(&stat, 0, sizeof(stat));
+	(*context->methods->stats) (context, NULL, (void *) &level, &stat, true);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, 0, sizeof(nulls));
+
+	if (name)
+		values[0] = CStringGetTextDatum(name);
+	else
+		nulls[0] = true;
+
+	if (ident)
+	{
+		int		idlen = strlen(ident);
+		char		clipped_ident[MEMORY_CONTEXT_IDENT_DISPLAY_SIZE];
+
+		/*
+		 * Some identifiers such as SQL query string can be very long,
+		 * truncate oversize identifiers.
+		 */
+		if (idlen >= MEMORY_CONTEXT_IDENT_DISPLAY_SIZE)
+			idlen = pg_mbcliplen(ident, idlen, MEMORY_CONTEXT_IDENT_DISPLAY_SIZE - 1);
+
+		memcpy(clipped_ident, ident, idlen);
+		clipped_ident[idlen] = '\0';
+		values[1] = CStringGetTextDatum(clipped_ident);
+	}
+	else
+		nulls[1] = true;
+
+	if (parent)
+		values[2] = CStringGetTextDatum(parent);
+	else
+		nulls[2] = true;
+
+	values[3] = Int32GetDatum(level);
+	values[4] = Int64GetDatum(stat.totalspace);
+	values[5] = Int64GetDatum(stat.nblocks);
+	values[6] = Int64GetDatum(stat.freespace);
+	values[7] = Int64GetDatum(stat.freechunks);
+	values[8] = Int64GetDatum(stat.totalspace - stat.freespace);
+	tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+
+	for (child = context->firstchild; child != NULL; child = child->nextchild)
+	{
+		PutMemoryContextsStatsTupleStore(tupstore, tupdesc,
+								  child, name, level + 1);
+	}
+}
+
+/*
+ * pg_get_backend_memory_contexts
+ *		SQL SRF showing backend memory context.
+ */
+Datum
+pg_get_backend_memory_contexts(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcontext;
+
+	/* check to see if caller supports us returning a tuplestore */
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	/* Build a tuple descriptor for our result type */
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	PutMemoryContextsStatsTupleStore(tupstore, tupdesc,
+								TopMemoryContext, NULL, 0);
+
+	/* clean up and return the tuplestore */
+	tuplestore_donestoring(tupstore);
+
+	return (Datum) 0;
+}
+
+/*
+ * pg_log_backend_memory_contexts
+ *		Signal a backend process to log its memory contexts.
+ *
+ * Only superusers are allowed to signal to log the memory contexts
+ * because allowing any users to issue this request at an unbounded
+ * rate would cause lots of log messages and which can lead to
+ * denial of service.
+ *
+ * On receipt of this signal, a backend sets the flag in the signal
+ * handler, which causes the next CHECK_FOR_INTERRUPTS() to log the
+ * memory contexts.
+ */
+Datum
+pg_log_backend_memory_contexts(PG_FUNCTION_ARGS)
+{
+	int			pid = PG_GETARG_INT32(0);
+	PGPROC	   *proc = BackendPidGetProc(pid);
+
+	/*
+	 * BackendPidGetProc returns NULL if the pid isn't valid; but by the time
+	 * we reach kill(), a process for which we get a valid proc here might
+	 * have terminated on its own.  There's no way to acquire a lock on an
+	 * arbitrary process to prevent that. But since this mechanism is usually
+	 * used to debug a backend running and consuming lots of memory, that it
+	 * might end on its own first and its memory contexts are not logged is
+	 * not a problem.
+	 */
+	if (proc == NULL)
+	{
+		/*
+		 * This is just a warning so a loop-through-resultset will not abort
+		 * if one backend terminated on its own during the run.
+		 */
+		ereport(WARNING,
+				(errmsg("PID %d is not a PostgreSQL server process", pid)));
+		PG_RETURN_BOOL(false);
+	}
+
+	/* Only allow superusers to log memory contexts. */
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be a superuser to log memory contexts")));
+
+	if (SendProcSignal(pid, PROCSIG_LOG_MEMORY_CONTEXT, proc->backendId) < 0)
+	{
+		/* Again, just a warning to allow loops */
+		ereport(WARNING,
+				(errmsg("could not send signal to process %d: %m", pid)));
+		PG_RETURN_BOOL(false);
+	}
+
+	PG_RETURN_BOOL(true);
 }
 
 /*

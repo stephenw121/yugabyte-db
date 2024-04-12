@@ -29,8 +29,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_TSERVER_REMOTE_BOOTSTRAP_SERVICE_H_
-#define YB_TSERVER_REMOTE_BOOTSTRAP_SERVICE_H_
+#pragma once
 
 #include <string>
 #include <unordered_map>
@@ -69,6 +68,10 @@ class RemoteBootstrapServiceImpl : public RemoteBootstrapServiceIf {
   void BeginRemoteBootstrapSession(const BeginRemoteBootstrapSessionRequestPB* req,
                                    BeginRemoteBootstrapSessionResponsePB* resp,
                                    rpc::RpcContext context) override;
+
+  void BeginRemoteSnapshotTransferSession(
+      const BeginRemoteSnapshotTransferSessionRequestPB* req,
+      BeginRemoteSnapshotTransferSessionResponsePB* resp, rpc::RpcContext context) override;
 
   void CheckRemoteBootstrapSessionActive(
       const CheckRemoteBootstrapSessionActiveRequestPB* req,
@@ -115,6 +118,8 @@ class RemoteBootstrapServiceImpl : public RemoteBootstrapServiceIf {
       ChangePeerRoleResponsePB* resp,
       rpc::RpcContext context) override;
 
+  void DumpStatusHtml(std::ostream& out);
+
  private:
   struct SessionData {
     scoped_refptr<RemoteBootstrapSession> session;
@@ -143,6 +148,11 @@ class RemoteBootstrapServiceImpl : public RemoteBootstrapServiceIf {
   typedef std::unordered_map<std::string, SessionData> SessionMap;
 
   typedef std::unordered_map<std::string, std::shared_ptr<LogAnchorSessionData>> LogAnchorsMap;
+
+  template <typename Request>
+  Result<scoped_refptr<RemoteBootstrapSession>> CreateRemoteSession(
+      const Request* req, const ServerRegistrationPB* tablet_leader_conn_info,
+      const std::string& requestor_string, RemoteBootstrapErrorPB::Code* error_code);
 
   // Validate the data identifier in a FetchData request.
   Status ValidateFetchRequestDataId(
@@ -195,5 +205,3 @@ class RemoteBootstrapServiceImpl : public RemoteBootstrapServiceIf {
 
 } // namespace tserver
 } // namespace yb
-
-#endif // YB_TSERVER_REMOTE_BOOTSTRAP_SERVICE_H_

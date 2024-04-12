@@ -17,6 +17,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_opfamily.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parse_coerce.h"
 #include "optimizer/clauses.h"
@@ -2665,7 +2666,7 @@ check_hashjoinable(RestrictInfo *restrictinfo)
  *	  If the restrictinfo's clause can potentially be a batched join clause
  *	  then yb_batched_rinfo is filled in with candidate batched versions of
  *	  this clause.
- *		
+ *
  *	  Note that this does nothing if yb_bnl_batch_size indicates no batching.
  *	  Right now we only support batching mergejoinable conditions of the form
  *	  var_1 op var_2. These yield batched expressions,
@@ -2685,71 +2686,120 @@ check_batchable(RestrictInfo *restrictinfo)
 	if (!restrictinfo->mergeopfamilies)
 		return;
 
-	leftarg = linitial(opexpr->args);
-	rightarg = lsecond(opexpr->args);
-
-	Node *outer = leftarg;
-	Node *inner = rightarg;
-
-	if (!IsA(outer, Var) || !IsA(inner, Var))
-		return;
 	if (bms_overlap(restrictinfo->left_relids, restrictinfo->right_relids))
 		return;
 
-	Oid outerType = exprType(outer);
-	int outerTypMod = exprTypmod(outer);
-	Oid innerType = exprType(inner);
-	int innerTypMod = exprTypmod(inner);
-	Oid opno = opexpr->opno;
+	leftarg = linitial(opexpr->args);
+	rightarg = lsecond(opexpr->args);
 
-	int num_batched_rinfos = 2;
+	Node *outer;
+	Node *inner;
 
-	if (outerType != innerType)
+	Node *args[] = {leftarg, rightarg};
+
+	/*
+	 * We currently only support cross-type IN conditions within the integer
+	 * ops families.
+	 */
+	bool is_supported_cross_type_op = false;
+	ListCell *lc;
+	foreach(lc, restrictinfo->mergeopfamilies)
 	{
-		/* We need to coerce one of the operands to a common type. */
-		Oid finalargtype = innerType;
-		Oid finalargtypmod = innerTypMod;
-		Node *coerced = coerce_to_target_type(NULL, outer, outerType,
-											  finalargtype, finalargtypmod,
-											  COERCION_IMPLICIT,
-											  COERCE_IMPLICIT_CAST, -1);
-		if (coerced == NULL)
-		{
-			finalargtype = outerType;
-			finalargtypmod = outerTypMod;
-			coerced = coerce_to_target_type(NULL, inner, innerType,
-											finalargtype, finalargtypmod,
-											COERCION_IMPLICIT,
-											COERCE_IMPLICIT_CAST, -1);
-
-			/* If we can't cast either operand, we can't batch. */
-			if (coerced == NULL)
-				return;
-
-			inner = outer;
-		}
-		
-		/* Casted operand needs to always be on the outer side for now. */
-		outer = coerced;
-
-		char *opname = get_opname(opno);
-		List *names = lappend(NIL, makeString(opname));
-		
-		/* Find an equivalent operator whose operands are of the same type. */
-		Oid newopno = 
-			OpernameGetOprid(names, finalargtype, finalargtype);
-		if (!OidIsValid(newopno))
-			return;
-		
-		opno = newopno;
-		pfree(opname);
-
-		/* Only one isomoporh of this expression is batchable. */
-		num_batched_rinfos = 1;
+		Oid opfamily = lfirst_oid(lc);
+		is_supported_cross_type_op |= opfamily == INTEGER_BTREE_FAM_OID;
+		is_supported_cross_type_op |= opfamily == INTEGER_LSM_FAM_OID;
 	}
 
-	for (size_t i = 0; i < num_batched_rinfos; i++)
+	Oid opno = opexpr->opno;
+
+	/*
+	 * Try to make batched expressions of the forms
+	 * leftarg = BatchedExpr(rightarg) or rightarg = BatchedExpr(leftarg)
+	 * with necessary type checking.
+	 */
+	for (int i = 0; i < 2; i++)
 	{
+		inner = args[i];
+		outer = args[1 - i];
+		if (!IsA(inner, Var) &&
+			!(IsA(inner, RelabelType) &&
+			  IsA(((RelabelType *) inner)->arg, Var)))
+			continue;
+
+		Oid outerType = exprType(outer);
+		Oid innerType = exprType(inner);
+		int innerTypMod = exprTypmod(inner);
+
+		/*
+		 * If we need a unsupported cross-type join, try to coerce
+		 * both sides to be the same type.
+		 */
+		if (!is_supported_cross_type_op && (outerType != innerType))
+		{
+			/* We need to coerce the outer operand to the inner type. */
+			Oid finalargtype = innerType;
+			Oid finalargtypmod = innerTypMod;
+			Node *coerced = NULL;
+
+			MemoryContext cxt = GetCurrentMemoryContext();
+
+			PG_TRY();
+			{
+				coerced = coerce_to_target_type(NULL, outer, outerType,
+														  finalargtype, finalargtypmod,
+														  COERCION_IMPLICIT,
+														  COERCE_IMPLICIT_CAST, -1);
+			}
+			PG_CATCH();
+			{
+				/*
+				 * Doing nothing here as if we encounter an error during type
+				 * coercion, we'll consider this coercion impossible. One would
+				 * usually expect coerce_to_target_type to return NULL in all
+				 * cases. Unfortunately, in some cases like where a record type
+				 * is being coerced into an incompatible complex UDT, it logs an
+				 * error instead. Making this a workaround for now.
+				 */
+
+				MemoryContext errcxt = MemoryContextSwitchTo(cxt);
+				ErrorData *errdata = CopyErrorData();
+				int errcode = errdata->sqlerrcode;
+				FreeErrorData(errdata);
+
+				if (errcode == ERRCODE_CANNOT_COERCE)
+				{
+					FlushErrorState();
+				}
+				else
+				{
+					MemoryContextSwitchTo(errcxt);
+					PG_RE_THROW();
+				}
+			}
+			PG_END_TRY();
+
+
+			/* Outer can't be coerced to inner type, bail and continue. */
+			if (coerced == NULL)
+				continue;
+
+			/* Make outer the new coerced expression. */
+			outer = coerced;
+
+			char *opname = get_opname(opno);
+			List *names = lappend(NIL, makeString(opname));
+
+			/* Find an equivalent operator whose operands are of the same type. */
+			Oid newopno =
+				OpernameGetOprid(names, finalargtype, finalargtype);
+			pfree(opname);
+
+			if (!OidIsValid(newopno))
+				continue;
+
+			opno = newopno;
+		}
+
 		YbBatchedExpr *bexpr = makeNode(YbBatchedExpr);
 		bexpr->orig_expr = (Expr*) copyObject(outer);
 
@@ -2771,9 +2821,10 @@ check_batchable(RestrictInfo *restrictinfo)
 							  restrictinfo->nullable_relids);
 		restrictinfo->yb_batched_rinfo =
 			lappend(restrictinfo->yb_batched_rinfo, batched);
-		
-		Node *tmp = outer;
-		outer = inner;
-		inner = tmp;
+
+		opno = get_commutator(opno);
+
+		if (opno == InvalidOid)
+			break;
 	}
 }

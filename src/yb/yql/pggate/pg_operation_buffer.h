@@ -11,11 +11,12 @@
 // under the License.
 //
 
-#ifndef YB_YQL_PGGATE_PG_OPERATION_BUFFER_H_
-#define YB_YQL_PGGATE_PG_OPERATION_BUFFER_H_
+#pragma once
 
 #include <functional>
 #include <memory>
+
+#include "yb/ash/wait_state.h"
 
 #include "yb/common/common_fwd.h"
 #include "yb/common/pg_types.h"
@@ -25,9 +26,11 @@
 
 #include "yb/yql/pggate/pg_gate_fwd.h"
 #include "yb/yql/pggate/pg_perform_future.h"
+#include "yb/yql/pggate/pg_tools.h"
 
-namespace yb {
-namespace pggate {
+namespace yb::pggate {
+
+class PgDocMetrics;
 
 struct BufferingSettings {
   size_t max_batch_size;
@@ -48,9 +51,11 @@ struct BufferableOperations {
 
 class PgOperationBuffer {
  public:
-  using Flusher = std::function<Result<PerformFuture>(BufferableOperations, bool)>;
+  using OperationsFlusher = std::function<Result<PerformFuture>(BufferableOperations&&, bool)>;
 
-  PgOperationBuffer(const Flusher& flusher, const BufferingSettings& buffering_settings);
+  PgOperationBuffer(
+      OperationsFlusher&& ops_flusher, PgDocMetrics* metrics,
+      PgWaitEventWatcher::Starter wait_starter, const BufferingSettings& buffering_settings);
   ~PgOperationBuffer();
   Status Add(const PgTableDesc& table, PgsqlWriteOpPtr op, bool transactional);
   Status Flush();
@@ -64,7 +69,4 @@ class PgOperationBuffer {
   std::unique_ptr<Impl> impl_;
 };
 
-} // namespace pggate
-} // namespace yb
-
-#endif // YB_YQL_PGGATE_PG_OPERATION_BUFFER_H_
+} // namespace yb::pggate

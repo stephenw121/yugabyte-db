@@ -3,21 +3,26 @@ package com.yugabyte.yw.commissioner.tasks;
 
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.UserTaskDetails;
+import com.yugabyte.yw.common.DrConfigStates.SourceUniverseState;
+import com.yugabyte.yw.common.DrConfigStates.State;
+import com.yugabyte.yw.common.DrConfigStates.TargetUniverseState;
+import com.yugabyte.yw.common.XClusterUniverseService;
+import com.yugabyte.yw.models.Restore;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.XClusterConfig;
-import java.util.List;
-import java.util.Map;
+import com.yugabyte.yw.models.XClusterConfig.XClusterConfigStatusType;
+import com.yugabyte.yw.models.XClusterTableConfig;
 import java.util.Set;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
-import org.yb.master.MasterDdlOuterClass;
 
 @Slf4j
-public class RestartXClusterConfig extends CreateXClusterConfig {
+public class RestartXClusterConfig extends EditXClusterConfig {
 
   @Inject
-  protected RestartXClusterConfig(BaseTaskDependencies baseTaskDependencies) {
-    super(baseTaskDependencies);
+  protected RestartXClusterConfig(
+      BaseTaskDependencies baseTaskDependencies, XClusterUniverseService xClusterUniverseService) {
+    super(baseTaskDependencies, xClusterUniverseService);
   }
 
   @Override
@@ -25,60 +30,141 @@ public class RestartXClusterConfig extends CreateXClusterConfig {
     log.info("Running {}", getName());
 
     XClusterConfig xClusterConfig = getXClusterConfigFromTaskParams();
-    Universe sourceUniverse = Universe.getOrBadRequest(xClusterConfig.sourceUniverseUUID);
-    Universe targetUniverse = Universe.getOrBadRequest(xClusterConfig.targetUniverseUUID);
+    Universe sourceUniverse = Universe.getOrBadRequest(xClusterConfig.getSourceUniverseUUID());
+    Universe targetUniverse = Universe.getOrBadRequest(xClusterConfig.getTargetUniverseUUID());
     try {
       // Lock the source universe.
-      lockUniverseForUpdate(sourceUniverse.universeUUID, sourceUniverse.version);
+      lockAndFreezeUniverseForUpdate(
+          sourceUniverse.getUniverseUUID(), sourceUniverse.getVersion(), null /* Txn callback */);
       try {
         // Lock the target universe.
-        lockUniverseForUpdate(targetUniverse.universeUUID, targetUniverse.version);
+        lockAndFreezeUniverseForUpdate(
+            targetUniverse.getUniverseUUID(), targetUniverse.getVersion(), null /* Txn callback */);
 
-        createXClusterConfigSetStatusTask(XClusterConfig.XClusterConfigStatusType.Updating)
+        createCheckXUniverseAutoFlag(sourceUniverse, targetUniverse)
+            .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.PreflightChecks);
+
+        // Set table type for old xCluster configs.
+        xClusterConfig.updateTableType(taskParams().getTableInfoList());
+
+        // Do not skip bootstrapping for the following tables. It will check if it is required.
+        if (taskParams().getBootstrapParams() != null) {
+          xClusterConfig.updateNeedBootstrapForTables(
+              taskParams().getBootstrapParams().tables, true /* needBootstrap */);
+        }
+
+        createXClusterConfigSetStatusTask(
+                xClusterConfig, XClusterConfig.XClusterConfigStatusType.Updating)
             .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.DeleteXClusterReplication);
 
-        // Set needBootstrap to true for all tables. It will check if it is required.
-        xClusterConfig.setNeedBootstrapForTables(
-            xClusterConfig.getTables(), true /* needBootstrap */);
+        Set<String> tableIds = getTableIds(taskParams().getTableInfoList());
 
-        Set<String> tableIds = xClusterConfig.getTables();
-        Map<String, List<String>> mainTableIndexTablesMap =
-            getMainTableIndexTablesMap(sourceUniverse, tableIds);
-        addIndexTables(tableIds, mainTableIndexTablesMap);
+        // A replication group with no tables in it cannot exist in YBDB. If all the tables must be
+        // removed from the replication group, remove the replication group.
+        boolean isRestartWholeConfig =
+            xClusterConfig.getTableIdsWithReplicationSetup(tableIds, true /* done */).size()
+                >= xClusterConfig.getTableIdsWithReplicationSetup().size();
+        log.info("isRestartWholeConfig is {}", isRestartWholeConfig);
+        if (isRestartWholeConfig) {
+          createXClusterConfigSetStatusForTablesTask(
+              xClusterConfig,
+              getTableIds(taskParams().getTableInfoList()),
+              XClusterTableConfig.Status.Updating);
 
-        List<MasterDdlOuterClass.ListTablesResponsePB.TableInfo> requestedTableInfoList =
-            getRequestedTableInfoList(tableIds, sourceUniverse, targetUniverse);
-        xClusterConfig.setTableType(requestedTableInfoList);
+          // Delete the replication group.
+          createDeleteXClusterConfigSubtasks(
+              xClusterConfig,
+              true /* keepEntry */,
+              taskParams().isForced(),
+              false) /* deletePitrConfigs */;
 
-        // Delete the xCluster config.
-        createDeleteXClusterConfigSubtasks(xClusterConfig, true /* keepEntry */);
+          if (xClusterConfig.isUsedForDr()) {
+            createSetDrStatesTask(
+                    xClusterConfig,
+                    State.Initializing,
+                    SourceUniverseState.Unconfigured,
+                    TargetUniverseState.Unconfigured,
+                    null /* keyspacePending */)
+                .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.ConfigureUniverse);
+          }
 
-        createXClusterConfigSetStatusTask(XClusterConfig.XClusterConfigStatusType.Updating);
+          createXClusterConfigSetStatusTask(
+              xClusterConfig, XClusterConfig.XClusterConfigStatusType.Updating);
 
-        addSubtasksToCreateXClusterConfig(
-            sourceUniverse, targetUniverse, requestedTableInfoList, mainTableIndexTablesMap);
+          createXClusterConfigSetStatusForTablesTask(
+              xClusterConfig,
+              getTableIds(taskParams().getTableInfoList()),
+              XClusterTableConfig.Status.Updating);
 
-        createXClusterConfigSetStatusTask(XClusterConfig.XClusterConfigStatusType.Running)
+          addSubtasksToCreateXClusterConfig(
+              xClusterConfig,
+              taskParams().getTableInfoList(),
+              taskParams().getMainTableIndexTablesMap(),
+              taskParams().getSourceTableIdsWithNoTableOnTargetUniverse(),
+              taskParams().getPitrParams(),
+              taskParams().isForceBootstrap());
+        } else {
+          createXClusterConfigSetStatusForTablesTask(
+              xClusterConfig, tableIds, XClusterTableConfig.Status.Updating);
+
+          createRemoveTableFromXClusterConfigSubtasks(
+              xClusterConfig, tableIds, true /* keepEntry */);
+
+          createXClusterConfigSetStatusForTablesTask(
+              xClusterConfig, tableIds, XClusterTableConfig.Status.Updating);
+
+          addSubtasksToAddTablesToXClusterConfig(
+              xClusterConfig,
+              taskParams().getTableInfoList(),
+              taskParams().getMainTableIndexTablesMap(),
+              tableIds);
+        }
+
+        createXClusterConfigSetStatusTask(
+                xClusterConfig, XClusterConfig.XClusterConfigStatusType.Running)
             .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.ConfigureUniverse);
 
-        createMarkUniverseUpdateSuccessTasks(targetUniverse.universeUUID)
+        createMarkUniverseUpdateSuccessTasks(targetUniverse.getUniverseUUID())
             .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.ConfigureUniverse);
 
-        createMarkUniverseUpdateSuccessTasks(sourceUniverse.universeUUID)
+        createMarkUniverseUpdateSuccessTasks(sourceUniverse.getUniverseUUID())
             .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.ConfigureUniverse);
 
         getRunnableTask().runSubTasks();
       } finally {
         // Unlock the target universe.
-        unlockUniverseForUpdate(targetUniverse.universeUUID);
+        unlockUniverseForUpdate(targetUniverse.getUniverseUUID());
       }
     } catch (Exception e) {
       log.error("{} hit error : {}", getName(), e.getMessage());
-      setXClusterConfigStatus(XClusterConfig.XClusterConfigStatusType.Failed);
+
+      // Set XClusterConfig status to Running if at least one table is running.
+      Set<String> tablesInRunningStatus =
+          xClusterConfig.getTableIdsInStatus(
+              xClusterConfig.getTableIds(), XClusterTableConfig.Status.Running);
+      if (tablesInRunningStatus.isEmpty()) {
+        xClusterConfig.updateStatus(XClusterConfigStatusType.Failed);
+      } else {
+        xClusterConfig.updateStatus(XClusterConfigStatusType.Running);
+      }
+      // Set tables in updating status to failed.
+      Set<String> tablesInUpdatingStatus =
+          xClusterConfig.getTableIdsInStatus(
+              getTableIds(taskParams().getTableInfoList()),
+              X_CLUSTER_TABLE_CONFIG_PENDING_STATUS_LIST);
+      xClusterConfig.updateStatusForTables(
+          tablesInUpdatingStatus, XClusterTableConfig.Status.Failed);
+      // Set backup and restore status to failed and alter load balanced.
+      boolean isLoadBalancerAltered = false;
+      for (Restore restore : restoreList) {
+        isLoadBalancerAltered = isLoadBalancerAltered || restore.isAlterLoadBalancer();
+      }
+      handleFailedBackupAndRestore(
+          backupList, restoreList, false /* isAbort */, isLoadBalancerAltered);
       throw new RuntimeException(e);
     } finally {
       // Unlock the source universe.
-      unlockUniverseForUpdate(sourceUniverse.universeUUID);
+      unlockUniverseForUpdate(sourceUniverse.getUniverseUUID());
     }
 
     log.info("Completed {}", getName());

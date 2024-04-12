@@ -282,8 +282,9 @@ static void AllocSetDelete(MemoryContext context);
 static Size AllocSetGetChunkSpace(MemoryContext context, void *pointer);
 static bool AllocSetIsEmpty(MemoryContext context);
 static void AllocSetStats(MemoryContext context,
-			  MemoryStatsPrintFunc printfunc, void *passthru,
-			  MemoryContextCounters *totals);
+						  MemoryStatsPrintFunc printfunc, void *passthru,
+						  MemoryContextCounters *totals,
+						  bool print_to_stderr);
 
 #ifdef MEMORY_CONTEXT_CHECKING
 static void AllocSetCheck(MemoryContext context);
@@ -1179,7 +1180,7 @@ AllocSetRealloc(MemoryContext context, void *pointer, Size size)
 		AllocBlock	block = (AllocBlock) (((char *) chunk) - ALLOC_BLOCKHDRSZ);
 		Size		chksize;
 		Size		blksize;
-		Size		oldsize = block->endptr - ((char *) block);
+		Size		oldblksize;
 
 		/*
 		 * Try to verify that we have a sane block pointer: it should
@@ -1195,6 +1196,8 @@ AllocSetRealloc(MemoryContext context, void *pointer, Size size)
 		/* Do the realloc */
 		chksize = MAXALIGN(size);
 		blksize = chksize + ALLOC_BLOCKHDRSZ + ALLOC_CHUNKHDRSZ;
+		oldblksize = block->endptr - ((char *) block);
+
 		block = (AllocBlock) realloc(block, blksize);
 		if (block == NULL)
 		{
@@ -1203,7 +1206,8 @@ AllocSetRealloc(MemoryContext context, void *pointer, Size size)
 			return NULL;
 		}
 		block->freeptr = block->endptr = ((char *) block) + blksize;
-		YbPgMemAddConsumption(blksize - oldsize);
+		YbPgMemSubConsumption(oldblksize);
+		YbPgMemAddConsumption(blksize);
 
 		/* Update pointers since block has likely been moved */
 		chunk = (AllocChunk) (((char *) block) + ALLOC_BLOCKHDRSZ);
@@ -1347,11 +1351,12 @@ AllocSetIsEmpty(MemoryContext context)
  * printfunc: if not NULL, pass a human-readable stats string to this.
  * passthru: pass this pointer through to printfunc.
  * totals: if not NULL, add stats about this context into *totals.
+ * print_to_stderr: print stats to stderr if true, elog otherwise.
  */
 static void
 AllocSetStats(MemoryContext context,
 			  MemoryStatsPrintFunc printfunc, void *passthru,
-			  MemoryContextCounters *totals)
+			  MemoryContextCounters *totals, bool print_to_stderr)
 {
 	AllocSet	set = (AllocSet) context;
 	Size		nblocks = 0;
@@ -1390,7 +1395,7 @@ AllocSetStats(MemoryContext context,
 				 "%zu total in %zd blocks; %zu free (%zd chunks); %zu used",
 				 totalspace, nblocks, freespace, freechunks,
 				 totalspace - freespace);
-		printfunc(context, passthru, stats_string);
+		printfunc(context, passthru, stats_string, print_to_stderr);
 	}
 
 	if (totals)

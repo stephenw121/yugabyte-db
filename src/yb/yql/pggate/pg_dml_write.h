@@ -12,8 +12,7 @@
 // under the License.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_PGGATE_PG_DML_WRITE_H_
-#define YB_YQL_PGGATE_PG_DML_WRITE_H_
+#pragma once
 
 #include "yb/yql/pggate/pg_dml.h"
 
@@ -36,14 +35,15 @@ class PgDmlWrite : public PgDml {
   void PrepareColumns();
 
   // force_non_bufferable flag indicates this operation should not be buffered.
-  Status Exec(bool force_non_bufferable = false);
+  Status Exec(ForceNonBufferable force_non_bufferable = ForceNonBufferable::kFalse);
 
   void SetIsSystemCatalogChange() {
-    write_req_->set_is_ysql_catalog_change(true);
+    write_req_->set_is_ysql_catalog_change_using_protobuf(true);
   }
 
-  void SetCatalogCacheVersion(const uint64_t catalog_cache_version) override {
-    write_req_->set_ysql_catalog_version(catalog_cache_version);
+  void SetCatalogCacheVersion(std::optional<PgOid> db_oid,
+                              uint64_t catalog_cache_version) override {
+    DoSetCatalogCacheVersion(write_req_.get(), db_oid, catalog_cache_version);
   }
 
   int32_t GetRowsAffectedCount() {
@@ -52,18 +52,25 @@ class PgDmlWrite : public PgDml {
 
   Status SetWriteTime(const HybridTime& write_time);
 
+  Status BindRow(uint64_t ybctid, YBCBindColumn* columns, int count);
+
+  bool packed() const {
+    return packed_;
+  }
+
  protected:
   // Constructor.
   PgDmlWrite(PgSession::ScopedRefPtr pg_session,
              const PgObjectId& table_id,
-             bool is_single_row_txn,
-             bool is_region_local);
+             bool is_region_local,
+             YBCPgTransactionSetting transaction_setting,
+             bool packed = false);
 
   // Allocate write request.
   void AllocWriteRequest();
 
   // Allocate column expression.
-  LWPgsqlExpressionPB *AllocColumnBindPB(PgColumn *col) override;
+  Result<LWPgsqlExpressionPB*> AllocColumnBindPB(PgColumn* col, PgExpr* expr) override;
 
   // Allocate target for selected or returned expressions.
   LWPgsqlExpressionPB *AllocTargetPB() override;
@@ -83,17 +90,19 @@ class PgDmlWrite : public PgDml {
   // Protobuf code.
   std::shared_ptr<LWPgsqlWriteRequestPB> write_req_;
 
-  bool is_single_row_txn_ = false; // default.
+  const YBCPgTransactionSetting transaction_setting_;
 
   int32_t rows_affected_count_ = 0;
+
+  bool packed_;
 
  private:
   Status DeleteEmptyPrimaryBinds();
 
   virtual PgsqlWriteRequestPB::PgsqlStmtType stmt_type() const = 0;
+
+  Status BindPackedRow(uint64_t ybctid, YBCBindColumn* columns, int count);
 };
 
 }  // namespace pggate
 }  // namespace yb
-
-#endif // YB_YQL_PGGATE_PG_DML_WRITE_H_

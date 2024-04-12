@@ -25,25 +25,39 @@
 #include "yb/integration-tests/yb_table_test_base.h"
 
 #include "yb/master/cluster_balance.h"
+#include "yb/master/master.h"
+
+#include "yb/rocksdb/util/multi_drive_test_env.h"
 
 #include "yb/tools/yb-admin_client.h"
+
+#include "yb/tablet/tablet_peer.h"
 
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
 #include "yb/tserver/tablet_server_options.h"
 
 #include "yb/util/backoff_waiter.h"
+#include "yb/util/metrics.h"
 #include "yb/util/monotime.h"
 #include "yb/util/multi_drive_test_env.h"
 
+METRIC_DECLARE_gauge_uint32(blacklisted_leaders);
+METRIC_DECLARE_event_stats(load_balancer_duration);
+METRIC_DECLARE_gauge_uint32(tablets_in_wrong_placement);
+METRIC_DECLARE_gauge_uint32(total_table_load_difference);
+
+DECLARE_int32(catalog_manager_bg_task_wait_ms);
 DECLARE_bool(enable_load_balancing);
 DECLARE_bool(load_balancer_drive_aware);
-DECLARE_int32(catalog_manager_bg_task_wait_ms);
+DECLARE_int32(load_balancer_max_concurrent_moves);
+DECLARE_int32(replication_factor);
 DECLARE_int32(TEST_slowdown_master_async_rpc_tasks_by_ms);
+DECLARE_int32(TEST_load_balancer_wait_ms);
 DECLARE_int32(TEST_load_balancer_wait_after_count_pending_tasks_ms);
 DECLARE_bool(tserver_heartbeat_metrics_add_drive_data);
-DECLARE_int32(load_balancer_max_concurrent_moves);
 DECLARE_int32(tserver_heartbeat_metrics_interval_ms);
+DECLARE_bool(TEST_fail_async_delete_replica_task);
 
 using namespace std::literals;
 
@@ -59,7 +73,7 @@ class StatEmuEnv : public EnvWrapper {
   StatEmuEnv() : EnvWrapper(Env::Default()) { }
 
   virtual Result<FilesystemStats> GetFilesystemStatsBytes(const std::string& f) override {
-    std::lock_guard<std::mutex> lock(data_mutex_);
+    std::lock_guard lock(data_mutex_);
     auto i = stats_.find(f);
     if (i == stats_.end()) {
       return target()->GetFilesystemStatsBytes(f);
@@ -68,7 +82,7 @@ class StatEmuEnv : public EnvWrapper {
   }
 
   void AddPathStats(const std::string& path, const Env::FilesystemStats& stats) {
-    std::lock_guard<std::mutex> lock(data_mutex_);
+    std::lock_guard lock(data_mutex_);
     ASSERT_TRUE(stats_.emplace(path, stats).second);
   }
 
@@ -122,8 +136,8 @@ typedef std::unordered_map<std::string,
                            std::pair<std::unordered_map<std::string, int>, int>> DriveStats;
 
 Status GetTabletsDriveStats(DriveStats* stats,
-                                    yb::MiniCluster* mini_cluster,
-                                    const yb::client::YBTableName& table_name) {
+                            yb::MiniCluster* mini_cluster,
+                            const yb::client::YBTableName& table_name) {
   scoped_refptr<master::TableInfo> tbl_info =
     VERIFY_RESULT(mini_cluster->GetLeaderMiniMaster())->catalog_manager().
       GetTableInfoFromNamespaceNameAndTableName(table_name.namespace_type(),
@@ -154,52 +168,6 @@ Status GetTabletsDriveStats(DriveStats* stats,
     }
   }
   return Status::OK();
-}
-
-class RocksDbMultiDriveTestEnv : public rocksdb::EnvWrapper, public MultiDriveTestEnvBase {
- public:
-  RocksDbMultiDriveTestEnv() : EnvWrapper(Env::Default()) {}
-
-  Status NewSequentialFile(const std::string& f, std::unique_ptr<SequentialFile>* r,
-                           const rocksdb::EnvOptions& options) override;
-  Status NewRandomAccessFile(const std::string& f,
-                             std::unique_ptr<RandomAccessFile>* r,
-                             const rocksdb::EnvOptions& options) override;
-  Status NewWritableFile(const std::string& f, std::unique_ptr<rocksdb::WritableFile>* r,
-                         const rocksdb::EnvOptions& options) override;
-  Status ReuseWritableFile(const std::string& f,
-                           const std::string& old_fname,
-                           std::unique_ptr<rocksdb::WritableFile>* r,
-                           const rocksdb::EnvOptions& options) override;
-};
-
-Status RocksDbMultiDriveTestEnv::NewSequentialFile(const std::string& f,
-                                                   std::unique_ptr<SequentialFile>* r,
-                                                   const rocksdb::EnvOptions& options) {
-  RETURN_NOT_OK(FailureStatus(f));
-  return target()->NewSequentialFile(f, r, options);
-}
-
-Status RocksDbMultiDriveTestEnv::NewRandomAccessFile(const std::string& f,
-                                                     std::unique_ptr<RandomAccessFile>* r,
-                                                     const rocksdb::EnvOptions& options) {
-  RETURN_NOT_OK(FailureStatus(f));
-  return target()->NewRandomAccessFile(f, r, options);
-}
-
-Status RocksDbMultiDriveTestEnv::NewWritableFile(const std::string& f,
-                                                 std::unique_ptr<rocksdb::WritableFile>* r,
-                                                 const rocksdb::EnvOptions& options) {
-  RETURN_NOT_OK(FailureStatus(f));
-  return target()->NewWritableFile(f, r, options);
-}
-
-Status RocksDbMultiDriveTestEnv::ReuseWritableFile(const std::string& f,
-                                                   const std::string& old_fname,
-                                                   std::unique_ptr<rocksdb::WritableFile>* r,
-                                                   const rocksdb::EnvOptions& options) {
-  RETURN_NOT_OK(FailureStatus(f));
-  return target()->ReuseWritableFile(f, old_fname, r, options);
 }
 
 } // namespace
@@ -234,7 +202,188 @@ class LoadBalancerMiniClusterTest : public LoadBalancerMiniClusterTestBase {
   int num_tablets() override {
     return 4;
   }
+
+  Status AddTserverToBlacklist(size_t idx, bool leader_blacklist) {
+    HostPort ts_hostport(mini_cluster()->mini_tablet_server(idx)->bound_rpc_addr());
+    RETURN_NOT_OK(
+        yb_admin_client_->ChangeBlacklist({ts_hostport}, true /* add */, leader_blacklist));
+    return Status::OK();
+  }
+
+  Status RemoveTserverFromBlacklist(size_t idx, bool leader_blacklist) {
+    HostPort ts_hostport(mini_cluster()->mini_tablet_server(idx)->bound_rpc_addr());
+    RETURN_NOT_OK(
+        yb_admin_client_->ChangeBlacklist({ts_hostport}, false /* add */, leader_blacklist));
+    return Status::OK();
+  }
+
+  Status WaitForNoPendingDeletes() {
+    auto ts_descriptors = VERIFY_RESULT(
+        mini_cluster()->GetLeaderMiniMaster())->master()->ts_manager()->GetAllDescriptors();
+    return WaitFor([&]() -> Result<bool> {
+      for (const auto& ts : ts_descriptors) {
+        if (ts->HasTabletDeletePending()) {
+          return false;
+        }
+      }
+      return true;
+    }, kDefaultTimeout, "WaitForNoPendingDeletes");
+  }
+
+  void DeleteTableAsync() {
+    if (table_exists_) {
+      ASSERT_OK(client_->DeleteTable(table_name(), false /* wait */));
+      table_exists_ = false;
+    }
+  }
 };
+
+class LoadBalancerMiniClusterRf3Test : public LoadBalancerMiniClusterTest {
+ protected:
+  size_t num_masters() override {
+    return 3;
+  }
+
+  size_t num_tablet_servers() override {
+    return 3;
+  }
+};
+
+TEST_F(LoadBalancerMiniClusterRf3Test, DurationMetric) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_load_balancer_wait_ms) = 5;
+  auto* mini_master = ASSERT_RESULT(mini_cluster()->GetLeaderMiniMaster());
+  auto master_metric_entity = mini_master->master()->metric_entity();
+  auto stats = master_metric_entity->FindOrCreateMetric<EventStats>(
+      &METRIC_load_balancer_duration);
+  // The metric should get a value.
+  ASSERT_OK(WaitFor([&] {
+    return stats->MeanValue() > 0;
+  }, 10s, "load_balancer_duration gets a value"));
+
+  ASSERT_OK(mini_cluster()->StepDownMasterLeader());
+
+  // The metric quantiles should be reset by the stepdown.
+  stats = master_metric_entity->FindOrCreateMetric<EventStats>(&METRIC_load_balancer_duration);
+  ASSERT_OK(WaitFor([&] {
+    return stats->MeanValue() == 0;
+  }, 10s, "load_balancer_duration value resets"));
+}
+
+TEST_F(LoadBalancerMiniClusterTest, TabletsInWrongPlacementMetric) {
+  const int ts_idx = 0;
+  auto* mini_master = ASSERT_RESULT(mini_cluster()->GetLeaderMiniMaster());
+  auto cluster_metric_entity = mini_master->master()->metric_entity_cluster();
+  auto tablets_in_wrong_placement =
+      cluster_metric_entity->FindOrNull<AtomicGauge<uint32_t>>(METRIC_tablets_in_wrong_placement);
+  ASSERT_EQ(tablets_in_wrong_placement->value(), 0);
+
+  // Prevent moves so we can reliably read the metric and get a non-zero value.
+  FLAGS_load_balancer_max_concurrent_adds = 0;
+
+  unsigned int peers_on_ts = 0;
+  auto ts_uuid = mini_cluster_->mini_tablet_server(ts_idx)->server()->permanent_uuid();
+  for (const auto& peer : ListTabletPeers(mini_cluster(), ListPeersFilter::kAll)) {
+    if (peer->permanent_uuid() == ts_uuid) {
+      ++peers_on_ts;
+    }
+  }
+  ASSERT_GT(peers_on_ts, 0);
+
+  ASSERT_EQ(tablets_in_wrong_placement->value(), 0);
+
+  // Blacklist first tserver.
+  ASSERT_OK(AddTserverToBlacklist(ts_idx, false /* leader_blacklist */));
+  SleepFor(FLAGS_catalog_manager_bg_task_wait_ms * 2ms);
+  ASSERT_EQ(tablets_in_wrong_placement->value(), peers_on_ts);
+
+  // Change placement info to make first tserver invalid.
+  // The invalid and blacklisted tablets should not be double-counted.
+  ASSERT_OK(yb_admin_client_->ModifyPlacementInfo("cloud1.rack2.zone,cloud2.rack3.zone", 3, ""));
+  SleepFor(FLAGS_catalog_manager_bg_task_wait_ms * 2ms);
+  ASSERT_EQ(tablets_in_wrong_placement->value(), peers_on_ts);
+
+  // Unblacklist first tserver.
+  // The tablets are still invalid, so the metric should not change.
+  ASSERT_OK(RemoveTserverFromBlacklist(ts_idx, false /* leader_blacklist */));
+  SleepFor(FLAGS_catalog_manager_bg_task_wait_ms * 2ms);
+  ASSERT_EQ(tablets_in_wrong_placement->value(), peers_on_ts);
+
+  // Change placement info to make first tserver valid again.
+  ASSERT_OK(yb_admin_client_->ModifyPlacementInfo(
+      "cloud1.rack1.zone,cloud1.rack2.zone,cloud2.rack3.zone", 3, ""));
+  ASSERT_OK(WaitFor([&] {
+    return tablets_in_wrong_placement->value() == 0;
+  }, 5s, "Wait for tablets_in_wrong_placement to be 0"));
+}
+
+TEST_F(LoadBalancerMiniClusterTest, BlacklistedLeadersMetric) {
+  auto* mini_master = ASSERT_RESULT(mini_cluster()->GetLeaderMiniMaster());
+  auto cluster_metric_entity = mini_master->master()->metric_entity_cluster();
+  auto blacklisted_leaders =
+      cluster_metric_entity->FindOrNull<AtomicGauge<uint32_t>>(METRIC_blacklisted_leaders);
+  ASSERT_EQ(blacklisted_leaders->value(), 0);
+
+  // Prevent leader moves so we can reliably read the metric and get a non-zero value.
+  FLAGS_load_balancer_max_concurrent_moves = 0;
+
+  // Leader blacklist first tserver.
+  ASSERT_OK(AddTserverToBlacklist(0 /* idx */, true /* leader_blacklist */));
+  ASSERT_OK(WaitFor([&] {
+    return blacklisted_leaders->value() > 0;
+  }, 5s, "Wait for blacklisted_leaders to reflect blacklisted leader"));
+}
+
+TEST_F(LoadBalancerMiniClusterTest, TableLoadDifferenceMetric) {
+  const auto kNumTablets = static_cast<uint32_t>(num_tablets());
+  auto* mini_master = ASSERT_RESULT(mini_cluster()->GetLeaderMiniMaster());
+  auto cluster_metric_entity = mini_master->master()->metric_entity_cluster();
+  auto load_difference_metric = cluster_metric_entity->FindOrNull<AtomicGauge<uint32_t>>(
+      METRIC_total_table_load_difference);
+
+  ASSERT_EQ(load_difference_metric->value(), 0);
+
+  // Prevent moves temporarily so we can reliably read the metric and get a non-zero value.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_load_balancer_max_concurrent_adds) = 0;
+
+  // Add a new node and wait for load difference to equal kNumTablets (each existing node has
+  // kNumTablets tablets, and the new node has 0).
+  auto new_ts_index = mini_cluster()->num_tablet_servers();
+  ASSERT_OK(mini_cluster()->AddTabletServer());
+  ASSERT_OK(mini_cluster()->WaitForTabletServerCount(new_ts_index + 1));
+  ASSERT_OK(WaitFor([&] {
+    return load_difference_metric->value() == kNumTablets;
+  }, 5s, "load_difference reflects new node"));
+
+  // Enable moves and verify that load_difference monotonically decreases to 0.
+  auto load_difference_low_water_mark = load_difference_metric->value();
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_load_balancer_max_concurrent_adds) = 1;
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    auto load_difference = load_difference_metric->value();
+    if (load_difference > load_difference_low_water_mark) {
+      return STATUS_FORMAT(
+          IllegalState, "load_difference unexpectedly increased from $0 to $1",
+          load_difference_low_water_mark, load_difference);
+    }
+    load_difference_low_water_mark = load_difference;
+    return load_difference == 0 && VERIFY_RESULT(client_->IsLoadBalancerIdle());
+  }, 30s, "Wait for tablet moves after adding ts-3"));
+
+  // Blacklist first tserver.
+  // The replicas should move off the blacklisted tserver and load_difference should increase to
+  // kNumTablets again.
+  auto load_difference_high_water_mark = load_difference_metric->value();
+  ASSERT_OK(AddTserverToBlacklist(0 /* idx */, false /* leader_blacklist */));
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    auto load_difference = load_difference_metric->value();
+    if (load_difference < load_difference_high_water_mark) {
+      return STATUS_FORMAT(
+          IllegalState, "load_difference unexpectedly decreased from $0 to $1",
+          load_difference_high_water_mark, load_difference);
+    }
+    load_difference_high_water_mark = load_difference;
+    return load_difference == kNumTablets && VERIFY_RESULT(client_->IsLoadBalancerIdle());
+  }, 30s, "Wait for tablet moves after blacklisting ts-0"));
+}
 
 // See issue #6278. This test tests the segfault that used to occur during a rare race condition,
 // where we would have an uninitialized TSDescriptor that we try to access.
@@ -353,7 +502,7 @@ TEST_F(LoadBalancerMiniClusterTest, NoLBOnDeletedTables) {
 
     // 2) Should respond to GetTableSchema with a NotFound error.
     client::YBSchema schema;
-    PartitionSchema partition_schema;
+    dockv::PartitionSchema partition_schema;
     Status s = client_->GetTableSchema(
         client::YBTableName(YQL_DATABASE_CQL,
                             table_name().namespace_name(),
@@ -508,18 +657,46 @@ TEST_F(LoadBalancerMiniClusterTest, CheckLoadBalanceDriveAware) {
   ASSERT_TRUE(found);
 }
 
+TEST_F(LoadBalancerMiniClusterTest, ClearPendingDeletesOnFailure) {
+  // Make sure that deleting tablet task is failed/times out.
+  FLAGS_TEST_fail_async_delete_replica_task = true;
+  // Delete the table, async. The sync call will fail since the table will not get deleted.
+  DeleteTableAsync();
+  // This sleep currently functions to wait until all DeleteTablet RPCs have been sent out and have
+  // failed. Need a better condition here.
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    auto& catalog_manager =
+        VERIFY_RESULT(mini_cluster()->GetLeaderMiniMaster())->catalog_manager();
+    auto recent_tasks = catalog_manager.GetRecentTasks();
+    auto num_delete_tasks = 0;
+    // Make sure that all deleted tasks triggered have failed and at least 1 delete has been
+    // triggered.
+    for (const auto& task : recent_tasks) {
+      if (task->type() == server::MonitoredTaskType::kDeleteReplica) {
+        if (task->state() != server::MonitoredTaskState::kFailed) {
+          return false;
+        }
+        num_delete_tasks++;
+      }
+    }
+    return num_delete_tasks > 0;
+  }, kDefaultTimeout, "deleted tasks failed"));
+  ASSERT_OK(WaitForNoPendingDeletes());
+}
+
+
 class LoadBalancerFailedDrive : public LoadBalancerMiniClusterTestBase {
  protected:
   void SetUp() override {
     ts_env_.reset(new MultiDriveTestEnv());
-    ts_rocksdb_env_.reset(new RocksDbMultiDriveTestEnv());
+    ts_rocksdb_env_.reset(new rocksdb::MultiDriveTestEnv());
     YBTableTestBase::SetUp();
   }
 
   void BeforeStartCluster() override {
     auto ts1_drive0 = mini_cluster()->GetTabletServerDrive(0, 0);
     dynamic_cast<MultiDriveTestEnv*>(ts_env_.get())->AddFailedPath(ts1_drive0);
-    dynamic_cast<RocksDbMultiDriveTestEnv*>(ts_rocksdb_env_.get())->AddFailedPath(ts1_drive0);
+    dynamic_cast<rocksdb::MultiDriveTestEnv*>(ts_rocksdb_env_.get())->AddFailedPath(ts1_drive0);
   }
 
   int num_drives() override {

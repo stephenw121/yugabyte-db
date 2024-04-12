@@ -17,16 +17,18 @@ import com.google.common.collect.ImmutableList;
 import com.yugabyte.yw.common.metrics.MetricLabelsBuilder;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.HealthCheck.Details;
+import com.yugabyte.yw.models.HealthCheck.Details.NodeData;
 import com.yugabyte.yw.models.Metric;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.KnownAlertLabels;
+import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.PlatformMetrics;
 import java.time.temporal.ChronoUnit;
 import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.CollectionUtils;
 
 @Slf4j
 public class HealthCheckMetrics {
@@ -130,8 +132,6 @@ public class HealthCheckMetrics {
         return PlatformMetrics.HEALTH_CHECK_C2N_CERT;
       case CLIENT_CA_CERT_CHECK:
         return PlatformMetrics.HEALTH_CHECK_CLIENT_CA_CERT;
-      case CLIENT_CERT_CHECK:
-        return PlatformMetrics.HEALTH_CHECK_CLIENT_CERT;
       case YB_CONTROLLER_CHECK:
         return PlatformMetrics.HEALTH_CHECK_YB_CONTROLLER_DOWN;
       default:
@@ -140,24 +140,21 @@ public class HealthCheckMetrics {
   }
 
   public static List<Metric> getNodeMetrics(
-      Customer customer, Universe universe, String nodeName, List<Details.Metric> metrics) {
+      Customer customer, Universe universe, NodeData nodeData, List<Details.Metric> metrics) {
     if (CollectionUtils.isEmpty(metrics)) {
       return Collections.emptyList();
     }
-    return metrics
-        .stream()
-        .flatMap(m -> buildNodeMetric(m, customer, universe, nodeName).stream())
+    return metrics.stream()
+        .flatMap(m -> buildNodeMetric(m, customer, universe, nodeData).stream())
         .collect(Collectors.toList());
   }
 
   private static List<Metric> buildNodeMetric(
-      Details.Metric metric, Customer customer, Universe universe, String nodeName) {
+      Details.Metric metric, Customer customer, Universe universe, NodeData nodeData) {
     if (CollectionUtils.isEmpty(metric.getValues())) {
       return Collections.emptyList();
     }
-    return metric
-        .getValues()
-        .stream()
+    return metric.getValues().stream()
         .map(
             value -> {
               Metric result =
@@ -172,8 +169,18 @@ public class HealthCheckMetrics {
                       .setSourceUuid(universe.getUniverseUUID())
                       .setLabels(
                           MetricLabelsBuilder.create().appendSource(universe).getMetricLabels())
-                      .setKeyLabel(KnownAlertLabels.NODE_NAME, nodeName)
+                      .setKeyLabel(KnownAlertLabels.NODE_NAME, nodeData.getNodeName())
+                      .setLabel(KnownAlertLabels.NODE_ADDRESS, nodeData.getNode())
+                      .setLabel(KnownAlertLabels.NODE_IDENTIFIER, nodeData.getNodeIdentifier())
                       .setValue(value.getValue());
+              if (nodeData.getNodeName() != null
+                  && universe.getNode(nodeData.getNodeName()) != null) {
+                NodeDetails nodeDetails = universe.getNode(nodeData.getNodeName());
+                result.setLabel(KnownAlertLabels.NODE_REGION, nodeDetails.getRegion());
+                result.setLabel(
+                    KnownAlertLabels.NODE_CLUSTER_TYPE,
+                    universe.getCluster(nodeDetails.placementUuid).clusterType.name());
+              }
               if (CollectionUtils.isNotEmpty(value.getLabels())) {
                 value
                     .getLabels()
@@ -193,7 +200,7 @@ public class HealthCheckMetrics {
         .setHelp("Boolean result of health checks")
         .setCustomerUUID(customer.getUuid())
         .setSourceUuid(universe.getUniverseUUID())
-        .setLabel(kUnivNameLabel, universe.name)
+        .setLabel(kUnivNameLabel, universe.getName())
         .setLabel(kUnivUUIDLabel, universe.getUniverseUUID().toString())
         .setKeyLabel(kNodeLabel, node)
         .setKeyLabel(kCheckLabel, checkName)

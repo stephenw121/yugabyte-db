@@ -8,10 +8,10 @@ import {
   REGISTER_RESPONSE,
   FETCH_PASSWORD_POLICY,
   FETCH_PASSWORD_POLICY_RESPONSE,
+  FETCH_ADMIN_NOTIFICATIONS,
+  FETCH_ADMIN_NOTIFICATIONS_RESPONSE,
   LOGIN,
   LOGIN_RESPONSE,
-  INSECURE_LOGIN,
-  INSECURE_LOGIN_RESPONSE,
   INVALID_CUSTOMER_TOKEN,
   RESET_TOKEN_ERROR,
   RESET_CUSTOMER,
@@ -23,6 +23,8 @@ import {
   FETCH_SOFTWARE_VERSIONS,
   FETCH_TLS_CERTS,
   FETCH_TLS_CERTS_RESPONSE,
+  FETCH_OIDC_TOKEN,
+  FETCH_OIDC_TOKEN_RESPONSE,
   ADD_TLS_CERT,
   ADD_TLS_CERT_RESPONSE,
   ADD_TLS_CERT_RESET,
@@ -44,10 +46,15 @@ import {
   EDIT_CUSTOMER_CONFIG_RESPONSE,
   FETCH_RUNTIME_CONFIGS,
   FETCH_RUNTIME_CONFIGS_RESPONSE,
+  FETCH_RUNTIME_CONFIGS_KEY_INFO,
+  FETCH_RUNTIME_CONFIGS_KEY_INFO_RESPONSE,
+  FETCH_PROVIDER_RUNTIME_CONFIGS,
+  FETCH_PROVIDER_RUNTIME_CONFIGS_RESPONSE,
   SET_RUNTIME_CONFIG,
   SET_RUNTIME_CONFIG_RESPONSE,
   DELETE_RUNTIME_CONFIG,
   DELETE_RUNTIME_CONFIG_RESPONSE,
+  RESET_RUNTIME_CONFIGS,
   FETCH_CUSTOMER_CONFIGS,
   FETCH_CUSTOMER_CONFIGS_RESPONSE,
   DELETE_CUSTOMER_CONFIG,
@@ -103,8 +110,9 @@ import {
   UPDATE_USER_PROFILE_SUCCESS,
   UPDATE_USER_PROFILE_FAILURE
 } from '../actions/customers';
+import { compareYBSoftwareVersions, isVersionStable } from '../utils/universeUtilsTyped';
 
-import { sortVersionStrings, isDefinedNotNull } from '../utils/ObjectUtils';
+import { isDefinedNotNull } from '../utils/ObjectUtils';
 import {
   getInitialState,
   setLoadingState,
@@ -118,11 +126,13 @@ const INITIAL_STATE = {
   currentUser: getInitialState({}),
   authToken: getInitialState({}),
   apiToken: getInitialState(null),
+  adminNotifications: getInitialState({}),
   tasks: [],
   status: null,
   error: null,
   loading: false,
   softwareVersions: [],
+  softwareVersionswithMetaData: [],
   alerts: {
     alertsList: [],
     updated: null
@@ -131,10 +141,12 @@ const INITIAL_STATE = {
   alertDestinations: getInitialState([]),
   alertTemplates: getInitialState([]),
   alertConfigs: getInitialState([]),
+  customers: getInitialState([]),
   deleteDestination: getInitialState([]),
   deleteAlertConfig: getInitialState([]),
   hostInfo: null,
   customerCount: {},
+  OIDCToken: getInitialState({}),
   yugawareVersion: getInitialState({}),
   profile: getInitialState({}),
   addConfig: getInitialState({}),
@@ -156,7 +168,8 @@ const INITIAL_STATE = {
   createAlertDestination: getInitialState({}),
   createAlertConfig: getInitialState({}),
   updateAlertDestination: getInitialState({}),
-  updateAlertConfig: getInitialState({})
+  updateAlertConfig: getInitialState({}),
+  providerRuntimeConfigs: getInitialState([])
 };
 
 export default function (state = INITIAL_STATE, action) {
@@ -174,6 +187,11 @@ export default function (state = INITIAL_STATE, action) {
       return { ...state, passwordValidationInfo: {} };
     case FETCH_PASSWORD_POLICY_RESPONSE:
       return { ...state, passwordValidationInfo: action.payload.data };
+
+    case FETCH_ADMIN_NOTIFICATIONS:
+      return setLoadingState(state, 'adminNotifications', {});
+    case FETCH_ADMIN_NOTIFICATIONS_RESPONSE:
+      return setPromiseResponse(state, 'adminNotifications', action);
 
     case LOGIN:
       return setLoadingState(state, 'authToken', {});
@@ -193,17 +211,6 @@ export default function (state = INITIAL_STATE, action) {
       return setLoadingState(state, 'apiToken', null);
     case API_TOKEN_RESPONSE:
       return setPromiseResponse(state, 'apiToken', action);
-
-    case INSECURE_LOGIN:
-      return {
-        ...state,
-        INSECURE_apiToken: null
-      };
-    case INSECURE_LOGIN_RESPONSE:
-      return {
-        ...state,
-        INSECURE_apiToken: action.payload.data.apiToken
-      };
     case LOGOUT:
       return { ...state };
     case LOGOUT_SUCCESS:
@@ -217,9 +224,35 @@ export default function (state = INITIAL_STATE, action) {
     case RESET_CUSTOMER:
       return { ...state, currentCustomer: getInitialState({}), authToken: getInitialState({}) };
     case FETCH_SOFTWARE_VERSIONS:
-      return { ...state, softwareVersions: [] };
-    case FETCH_SOFTWARE_VERSIONS_SUCCESS:
-      return { ...state, softwareVersions: sortVersionStrings(action.payload.data) };
+      return { ...state, softwareVersions: [], softwareVersionswithMetaData: [] };
+    case FETCH_SOFTWARE_VERSIONS_SUCCESS: {
+      const sortedStableDbVersions = action.payload.data.filter(
+        (release) => isVersionStable(release)).sort((versionA, versionB) =>
+          compareYBSoftwareVersions({
+            versionA: versionB,
+            versionB: versionA, options: {
+              suppressFormatError: true,
+              requireOrdering: true
+            }
+          }
+          ));
+      const sortedPreviewDbVersions = action.payload.data.filter(
+        (release) => !isVersionStable(release)).sort((versionA, versionB) =>
+          compareYBSoftwareVersions({
+            versionA: versionB,
+            versionB: versionA, options: {
+              suppressFormatError: true,
+              requireOrdering: true
+            }
+          }
+          ));
+      const sortedVersions = sortedStableDbVersions.concat(sortedPreviewDbVersions);
+      return {
+        ...state,
+        softwareVersions: sortedVersions,
+        softwareVersionswithMetaData: action.payload.releasesWithMetadata
+      };
+    }
     case FETCH_SOFTWARE_VERSIONS_FAILURE:
       return { ...state };
     case FETCH_TLS_CERTS:
@@ -250,6 +283,10 @@ export default function (state = INITIAL_STATE, action) {
     case FETCH_HOST_INFO_FAILURE:
       return { ...state, hostInfo: null };
 
+    case FETCH_OIDC_TOKEN:
+      return setLoadingState(state, 'OIDCToken', {});
+    case FETCH_OIDC_TOKEN_RESPONSE:
+      return setPromiseResponse(state, 'OIDCToken', action);
     case UPDATE_PROFILE:
       return setLoadingState(state, 'profile');
     case UPDATE_PROFILE_SUCCESS:
@@ -394,6 +431,16 @@ export default function (state = INITIAL_STATE, action) {
       return setLoadingState(state, 'runtimeConfigs', []);
     case FETCH_RUNTIME_CONFIGS_RESPONSE:
       return setPromiseResponse(state, 'runtimeConfigs', action);
+    case FETCH_RUNTIME_CONFIGS_KEY_INFO:
+      return setLoadingState(state, 'runtimeConfigsKeyMetadata', []);
+    case FETCH_RUNTIME_CONFIGS_KEY_INFO_RESPONSE:
+      return setPromiseResponse(state, 'runtimeConfigsKeyMetadata', action);
+    case FETCH_PROVIDER_RUNTIME_CONFIGS:
+      return setLoadingState(state, 'providerRuntimeConfigs', []);
+    case FETCH_PROVIDER_RUNTIME_CONFIGS_RESPONSE:
+      return setPromiseResponse(state, 'providerRuntimeConfigs', action);
+    case RESET_RUNTIME_CONFIGS:
+      return setLoadingState(state, 'runtimeConfigs', []);
     case SET_RUNTIME_CONFIG:
       return setLoadingState(state, 'updateRuntimeConfig', {});
     case SET_RUNTIME_CONFIG_RESPONSE:

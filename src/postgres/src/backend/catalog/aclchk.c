@@ -57,6 +57,7 @@
 #include "catalog/pg_ts_parser.h"
 #include "catalog/pg_ts_template.h"
 #include "catalog/pg_transform.h"
+#include "catalog/pg_yb_catalog_version.h"
 #include "catalog/pg_yb_tablegroup.h"
 #include "commands/dbcommands.h"
 #include "commands/event_trigger.h"
@@ -1771,6 +1772,13 @@ ExecGrant_Attribute(InternalGrant *istmt, Oid relOid, const char *relname,
 								 NameStr(pg_attribute_tuple->attname));
 
 	/*
+	 * The original old_acl is pfree'd by merge_acl_with_grant. If the
+	 * original column acl value is null, we cannot skip catalog update.
+	 */
+	Acl *yb_copy_of_old_acl =
+		(IsYugaByteEnabled() && !isNull) ? aclcopy(old_acl) : NULL;
+
+	/*
 	 * Generate new ACL.
 	 */
 	new_acl = merge_acl_with_grant(old_acl, istmt->is_grant,
@@ -1778,6 +1786,16 @@ ExecGrant_Attribute(InternalGrant *istmt, Oid relOid, const char *relname,
 								   istmt->behavior, istmt->grantees,
 								   col_privileges, grantorId,
 								   ownerId);
+
+	/* Skip catalog update if there is no ACL change. */
+	if (IsYugaByteEnabled() &&
+		yb_copy_of_old_acl &&
+		YbCheckAclCopiesEqual(yb_copy_of_old_acl, aclcopy(new_acl)))
+	{
+		pfree(new_acl);
+		ReleaseSysCache(attr_tuple);
+		return;
+	}
 
 	/*
 	 * We need the members of both old and new ACLs so we can correct the
@@ -3193,6 +3211,12 @@ ExecGrant_Tablegroup(InternalGrant *istmt)
 	Relation	relation;
 	ListCell   *cell;
 
+	if (MyDatabaseColocated)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot set privileges of an implicit tablegroup "
+						"in a colocated database")));
+
 	if (istmt->all_privs && istmt->privileges == ACL_NO_RIGHTS)
 		istmt->privileges = ACL_ALL_RIGHTS_TABLEGROUP;
 
@@ -3798,6 +3822,9 @@ aclcheck_error(AclResult aclerr, ObjectType objtype,
 					case OBJECT_TABLESPACE:
 						msg = gettext_noop("permission denied for tablespace %s");
 						break;
+					case OBJECT_YBPROFILE:
+						msg = gettext_noop("permission denied for profile %s");
+						break;
 					case OBJECT_TSCONFIGURATION:
 						msg = gettext_noop("permission denied for text search configuration %s");
 						break;
@@ -3962,6 +3989,7 @@ aclcheck_error(AclResult aclerr, ObjectType objtype,
 					case OBJECT_DEFACL:
 					case OBJECT_DOMCONSTRAINT:
 					case OBJECT_PUBLICATION_REL:
+					case OBJECT_YBPROFILE:
 					case OBJECT_ROLE:
 					case OBJECT_TRANSFORM:
 					case OBJECT_TSPARSER:
@@ -4214,6 +4242,8 @@ pg_class_aclmask(Oid table_oid, Oid roleid,
 		IsSystemClass(table_oid, classForm) &&
 		classForm->relkind != RELKIND_VIEW &&
 		!superuser_arg(roleid) &&
+		/* yb_db_admin is allowed to update pg_yb_catalog_version. */
+		!(IsYbDbAdminUser(roleid) && table_oid == YBCatalogVersionRelationId) &&
 		!allowSystemTableMods)
 	{
 #ifdef ACLDEBUG
@@ -4225,7 +4255,7 @@ pg_class_aclmask(Oid table_oid, Oid roleid,
 	/*
 	 * Otherwise, superusers bypass all permission-checking.
 	 */
-	if (superuser_arg(roleid))
+	if (superuser_arg(roleid) || IsYbDbAdminUser(roleid))
 	{
 #ifdef ACLDEBUG
 		elog(DEBUG2, "OID %u is superuser, home free", roleid);

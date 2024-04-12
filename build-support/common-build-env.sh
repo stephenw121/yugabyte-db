@@ -29,9 +29,58 @@ fi
 
 readonly YB_COMMON_BUILD_ENV_SOURCED=1
 
+yb_script_paths_are_set=false
+
 # -------------------------------------------------------------------------------------------------
 # Functions used during initialization
 # -------------------------------------------------------------------------------------------------
+
+set_script_paths() {
+  if [[ $yb_script_paths_are_set == "true" ]]; then
+    return
+  fi
+  yb_script_paths_are_set=true
+
+  # We check that all of these scripts actually exist in common-build-env-test.sh, that's why it is
+  # useful to invoke them using these constants.
+  export YB_SCRIPT_PATH_AGGREGATE_TEST_REPORTS=\
+$YB_SRC_ROOT/python/yugabyte/aggregate_test_reports.py
+  export YB_SCRIPT_PATH_BUILD_POSTGRES=$YB_SRC_ROOT/python/yugabyte/build_postgres.py
+  export YB_SCRIPT_PATH_CCMD_TOOL=$YB_SRC_ROOT/python/yugabyte/ccmd_tool.py
+  export YB_SCRIPT_PATH_CHECK_PYTHON_SYNTAX=$YB_SRC_ROOT/python/yugabyte/check_python_syntax.py
+  export YB_SCRIPT_PATH_DEDUP_THREAD_STACKS=$YB_SRC_ROOT/python/yugabyte/dedup_thread_stacks.py
+  export YB_SCRIPT_PATH_DEPENDENCY_GRAPH=$YB_SRC_ROOT/python/yugabyte/dependency_graph.py
+  export YB_SCRIPT_PATH_DOWNLOAD_AND_EXTRACT_ARCHIVE=\
+$YB_SRC_ROOT/python/yugabyte/download_and_extract_archive.py
+  export YB_SCRIPT_PATH_FIX_PATHS_IN_COMPILE_ERRORS=\
+$YB_SRC_ROOT/python/yugabyte/fix_paths_in_compile_errors.py
+  export YB_SCRIPT_PATH_GEN_AUTO_FLAGS_JSON=$YB_SRC_ROOT/python/yugabyte/gen_auto_flags_json.py
+  export YB_SCRIPT_PATH_GEN_FLAGS_METADATA=$YB_SRC_ROOT/python/yugabyte/gen_flags_metadata.py
+  export YB_SCRIPT_PATH_GEN_INITIAL_SYS_CATALOG_SNAPSHOT=\
+$YB_SRC_ROOT/python/yugabyte/gen_initial_sys_catalog_snapshot.py
+  export YB_SCRIPT_PATH_GEN_VERSION_INFO=$YB_SRC_ROOT/python/yugabyte/gen_version_info.py
+  export YB_SCRIPT_PATH_IS_SAME_PATH=$YB_SRC_ROOT/python/yugabyte/is_same_path.py
+  export YB_SCRIPT_PATH_KILL_LONG_RUNNING_MINICLUSTER_DAEMONS=\
+$YB_SRC_ROOT/python/yugabyte/kill_long_running_minicluster_daemons.py
+  export YB_SCRIPT_PATH_PARSE_TEST_FAILURE=$YB_SRC_ROOT/python/yugabyte/parse_test_failure.py
+  export YB_SCRIPT_PATH_POSTPROCESS_TEST_RESULT=\
+$YB_SRC_ROOT/python/yugabyte/postprocess_test_result.py
+  export YB_SCRIPT_PATH_PROCESS_TREE_SUPERVISOR=\
+$YB_SRC_ROOT/python/yugabyte/process_tree_supervisor.py
+  export YB_SCRIPT_PATH_REWRITE_TEST_LOG=$YB_SRC_ROOT/python/yugabyte/rewrite_test_log.py
+  export YB_SCRIPT_PATH_RUN_PVS_STUDIO_ANALYZER=\
+$YB_SRC_ROOT/python/yugabyte/run_pvs_studio_analyzer.py
+  export YB_SCRIPT_PATH_RUN_TESTS_ON_SPARK=$YB_SRC_ROOT/python/yugabyte/run_tests_on_spark.py
+  export YB_SCRIPT_PATH_SPLIT_LONG_COMMAND_LINE=\
+$YB_SRC_ROOT/python/yugabyte/split_long_command_line.py
+  export YB_SCRIPT_PATH_THIRDPARTY_TOOL=$YB_SRC_ROOT/python/yugabyte/thirdparty_tool.py
+  export YB_SCRIPT_PATH_UPDATE_TEST_RESULT_XML=\
+$YB_SRC_ROOT/python/yugabyte/update_test_result_xml.py
+  export YB_SCRIPT_PATH_YB_RELEASE_CORE_DB=$YB_SRC_ROOT/python/yugabyte/yb_release_core_db.py
+  export YB_SCRIPT_PATH_LIST_PACKAGED_TARGETS=$YB_SRC_ROOT/python/yugabyte/list_packaged_targets.py
+  export YB_SCRIPT_PATH_VALIDATE_BUILD_ROOT=$YB_SRC_ROOT/python/yugabyte/validate_build_root.py
+  export YB_SCRIPT_PATH_ANALYZE_TEST_RESULTS=$YB_SRC_ROOT/python/yugabyte/analyze_test_results.py
+}
 
 set_yb_src_root() {
   export YB_SRC_ROOT=$1
@@ -42,6 +91,8 @@ set_yb_src_root() {
   YB_COMPILER_WRAPPER_CC=$YB_BUILD_SUPPORT_DIR/compiler-wrappers/cc
   YB_COMPILER_WRAPPER_CXX=$YB_BUILD_SUPPORT_DIR/compiler-wrappers/c++
   yb_java_project_dirs=( "$YB_SRC_ROOT/java" )
+
+  set_script_paths
 }
 
 # Puts the current Git SHA1 in the current directory into the current_sha1 variable.
@@ -89,7 +140,7 @@ initialize_yugabyte_bash_common() {
       exit 1
     fi
   fi
-  popd >/dev/null
+  popd +0 >/dev/null
 }
 
 # This script is expected to be in build-support, a subdirectory of the repository root directory.
@@ -175,23 +226,15 @@ make_regex_from_list VALID_CMAKE_BUILD_TYPES "${VALID_CMAKE_BUILD_TYPES[@]}"
 
 readonly -a VALID_COMPILER_TYPES=(
   gcc
-  gcc5
-  gcc6
-  gcc7
-  gcc8
-  gcc9
-  gcc10
   gcc11
   gcc12
+  gcc13
   clang
-  clang7
-  clang8
-  clang9
-  clang10
-  clang11
-  clang12
-  clang13
   clang14
+  clang15
+  clang16
+  clang17
+  clang18
 )
 make_regex_from_list VALID_COMPILER_TYPES "${VALID_COMPILER_TYPES[@]}"
 
@@ -206,7 +249,6 @@ readonly -a VALID_ARCHITECTURES=(
   x86_64
   aarch64
   arm64
-  graviton2
 )
 make_regex_from_list VALID_ARCHITECTURES "${VALID_ARCHITECTURES[@]}"
 
@@ -258,6 +300,10 @@ readonly YB_DEFAULT_MVN_SETTINGS_PATH=$HOME/.m2/settings.xml
 MVN_OUTPUT_FILTER_REGEX='^\[INFO\] (Download(ing|ed)( from [-a-z0-9.]+)?): '
 MVN_OUTPUT_FILTER_REGEX+='|^\[INFO\] [^ ]+ already added, skipping$'
 MVN_OUTPUT_FILTER_REGEX+='|^\[INFO\] Copying .*[.]jar to .*[.]jar$'
+MVN_OUTPUT_FILTER_REGEX+='|^\[INFO\] Resolved: .*$'
+MVN_OUTPUT_FILTER_REGEX+='|^\[INFO\] Resolved plugin: .*$'
+MVN_OUTPUT_FILTER_REGEX+='|^\[INFO\] Resolved dependency: .*$'
+MVN_OUTPUT_FILTER_REGEX+='|^\[INFO\] Installing .* to .*$'
 MVN_OUTPUT_FILTER_REGEX+='|^Generating .*[.]html[.][.][.]$'
 readonly MVN_OUTPUT_FILTER_REGEX
 
@@ -267,7 +313,7 @@ readonly -a MVN_OPTS_TO_DOWNLOAD_ALL_DEPS=(
   dependency:go-offline
   dependency:resolve
   dependency:resolve-plugins
-  -DoutputFile=/dev/null
+  "-DoutputFile=/dev/null"
 )
 
 # -------------------------------------------------------------------------------------------------
@@ -315,6 +361,15 @@ is_apple_silicon=""  # Will be set to true or false when necessary.
 # Functions
 # -------------------------------------------------------------------------------------------------
 
+# Usage: expect_no_args "$#"
+# Alternative to expect_num_args 0 "$@", because it will trigger
+# https://www.shellcheck.net/wiki/SC2119 when passing no arguments.
+expect_no_args() {
+  if (( $1 != 0 )); then
+    fatal "${FUNCNAME[1]} expects at least zero arguments. Got: $1"
+  fi
+}
+
 yb_activate_debug_mode() {
   PS4='[${BASH_SOURCE[0]}:${LINENO} ${FUNCNAME[0]:-}] '
   set -x
@@ -344,13 +399,8 @@ decide_whether_to_use_linuxbrew() {
       if [[ ${predefined_build_root##*/} == *-linuxbrew-* ]]; then
         YB_USE_LINUXBREW=1
       fi
-    elif [[ -n ${YB_LINUXBREW_DIR:-} ||
-            ( ${YB_COMPILER_TYPE} =~ ^clang[0-9]+$ &&
-               $build_type =~ ^(release|prof_(gen|use))$ &&
-              "$( uname -m )" == "x86_64" &&
-              ${OSTYPE} =~ ^linux.*$ ) ]]; then
-      YB_USE_LINUXBREW=1
     fi
+    # Default is no linuxbrew
     export YB_USE_LINUXBREW=${YB_USE_LINUXBREW:-0}
   fi
 }
@@ -367,7 +417,7 @@ set_build_root() {
     local -r make_build_root_readonly=true
   fi
 
-  expect_num_args 0 "$@"
+  expect_no_args "$#"
   normalize_build_type
   readonly build_type
 
@@ -402,7 +452,7 @@ set_build_root() {
 
   if [[ -n ${predefined_build_root:-} &&
         $predefined_build_root != "$BUILD_ROOT" ]] &&
-     ! "$YB_BUILD_SUPPORT_DIR/is_same_path.py" "$predefined_build_root" "$BUILD_ROOT"; then
+     ! "$YB_SCRIPT_PATH_IS_SAME_PATH" "$predefined_build_root" "$BUILD_ROOT"; then
     fatal "An inconsistency between predefined BUILD_ROOT ('$predefined_build_root') and" \
           "computed BUILD_ROOT ('$BUILD_ROOT')."
   fi
@@ -494,21 +544,13 @@ set_build_type_based_on_jenkins_job_name() {
 }
 
 set_default_compiler_type() {
+  expect_vars_to_be_set build_type
   if [[ -z ${YB_COMPILER_TYPE:-} ]]; then
     if is_mac; then
       YB_COMPILER_TYPE=clang
+      adjust_compiler_type_on_mac
     elif [[ $OSTYPE =~ ^linux ]]; then
-      detect_architecture
-      if [[ ${YB_TARGET_ARCH} == "x86_64" ]]; then
-        if [[ ${build_type} =~ ^(debug|fastdebug|release|tsan|prof_(gen|use))$ ]]; then
-          YB_COMPILER_TYPE=clang14
-        else
-          YB_COMPILER_TYPE=clang13
-        fi
-      else
-        # https://github.com/yugabyte/yugabyte-db/issues/12603
-        YB_COMPILER_TYPE=clang12
-      fi
+      YB_COMPILER_TYPE=clang17
     else
       fatal "Cannot set default compiler type on OS $OSTYPE"
     fi
@@ -518,7 +560,7 @@ set_default_compiler_type() {
 }
 
 is_clang() {
-  if [[ $YB_COMPILER_TYPE == "clang" ]]; then
+  if [[ $YB_COMPILER_TYPE == clang* ]]; then
     return 0
   else
     return 1
@@ -535,14 +577,6 @@ is_gcc() {
 
 is_ubuntu() {
   [[ -f /etc/issue ]] && grep -q Ubuntu /etc/issue
-}
-
-build_compiler_if_necessary() {
-  # Sometimes we have to build the compiler before we can run CMake.
-  if is_clang && is_linux; then
-    log "Building clang before we can run CMake with compiler pointing to clang"
-    "$YB_THIRDPARTY_DIR/build_thirdparty.sh" llvm
-  fi
 }
 
 set_compiler_type_based_on_jenkins_job_name() {
@@ -569,6 +603,7 @@ set_compiler_type_based_on_jenkins_job_name() {
       return
     fi
   fi
+  adjust_compiler_type_on_mac
   validate_compiler_type
   readonly YB_COMPILER_TYPE
   export YB_COMPILER_TYPE
@@ -615,8 +650,17 @@ set_cmake_build_type_and_compiler_type() {
   fi
 
   if [[ -z ${build_type:-} ]]; then
-    log "Setting build type to 'debug' by default"
-    build_type=debug
+    if [[ ${YB_LINKING_TYPE:-} == *-lto ]]; then
+      if [[ ${yb_set_build_type_quietly:-} != "true" ]]; then
+        log "Setting build type to 'release' by default (YB_LINKING_TYPE=${YB_LINKING_TYPE})"
+      fi
+      build_type=release
+    else
+      if [[ ${yb_set_build_type_quietly:-} != "true" ]]; then
+        log "Setting build type to 'debug' by default"
+      fi
+      build_type=debug
+    fi
   fi
 
   normalize_build_type
@@ -718,7 +762,7 @@ set_mvn_parameters() {
   fi
   if is_jenkins; then
     local m2_repository_in_build_root=$BUILD_ROOT/m2_repository
-    if "$is_run_test_script" && [[ -d $m2_repository_in_build_root ]]; then
+    if [[ $is_run_test_script == "true" && -d $m2_repository_in_build_root ]]; then
       YB_MVN_LOCAL_REPO=$m2_repository_in_build_root
       # Do not use the "shared Maven settings" path even if it is available.
       YB_MVN_SETTINGS_PATH=$YB_DEFAULT_MVN_SETTINGS_PATH
@@ -792,7 +836,12 @@ append_common_mvn_opts() {
 # A utility function called by both 'build_yb_java_code' and 'build_yb_java_code_with_retries'.
 build_yb_java_code_filter_save_output() {
   set_mvn_parameters
-  log "Building Java code in $PWD"
+  local msg_prefix="Building Java code in $PWD"
+  if [[ -n ${java_code_build_purpose:-} ]]; then
+    log "$msg_prefix for $java_code_build_purpose"
+  else
+    log "$msg_prefix"
+  fi
 
   # --batch-mode hides download progress.
   # We are filtering out some patterns from Maven output, e.g.:
@@ -888,7 +937,7 @@ build_yb_java_code_in_all_dirs() {
       return 1
     fi
     # shellcheck disable=SC2119
-    popd
+    popd +0
   done
 }
 
@@ -956,7 +1005,7 @@ log_diagnostics_about_local_thirdparty() {
 # use custom gcc and clang installations. Sets cc_executable and cxx_executable variables. This is
 # used in compiler-wrapper.sh.
 find_compiler_by_type() {
-  expect_num_args 0 "$@"
+  expect_no_args "$#"
   expect_vars_to_be_set YB_COMPILER_TYPE
   if [[ -n ${YB_RESOLVED_C_COMPILER:-} && -n ${YB_RESOLVED_CXX_COMPILER:-} ]]; then
     cc_executable=$YB_RESOLVED_C_COMPILER
@@ -965,7 +1014,6 @@ find_compiler_by_type() {
   fi
 
   validate_compiler_type "$YB_COMPILER_TYPE"
-
   unset cc_executable
   unset cxx_executable
   case "$YB_COMPILER_TYPE" in
@@ -1010,7 +1058,8 @@ find_compiler_by_type() {
         cxx_executable=$(which "g++-$gcc_major_version")
       fi
     ;;
-    # This is the old Linuxbrew-based Clang 7 build type.
+    # Default Clang compiler on macOS, or a custom Clang installation with explicitly specified
+    # prefix.
     clang)
       if [[ -n ${YB_CLANG_PREFIX:-} ]]; then
         if [[ ! -d $YB_CLANG_PREFIX/bin ]]; then
@@ -1020,25 +1069,7 @@ find_compiler_by_type() {
       elif [[ $OSTYPE =~ ^darwin ]]; then
         cc_executable=/usr/bin/clang
       else
-        local clang_path
-        local clang_found=false
-        local clang_paths_to_try=(
-          "$YB_THIRDPARTY_DIR/clang-toolchain/bin/clang"
-          # clang is present in this location in pre-built third-party archives built before
-          # the transition to Linuxbrew (https://phabricator.dev.yugabyte.com/D982). This can be
-          # removed when the transition is complete.
-          "$YB_THIRDPARTY_DIR/installed/common/bin/clang"
-        )
-        for clang_path in "${clang_paths_to_try[@]}"; do
-          if [[ -f $clang_path ]]; then
-            cc_executable=$clang_path
-            clang_found=true
-            break
-          fi
-        done
-        if ! "$clang_found"; then
-          fatal "Failed to find clang at the following locations: ${clang_paths_to_try[*]}"
-        fi
+        fatal "Cannot determine Clang executable for YB_COMPILER_TYPE=${YB_COMPILER_TYPE}"
       fi
       if [[ -z ${cxx_executable:-} ]]; then
         cxx_executable=$cc_executable++  # clang -> clang++
@@ -1046,6 +1077,7 @@ find_compiler_by_type() {
       cc_executable+=${YB_CLANG_SUFFIX:-}
       cxx_executable+=${YB_CLANG_SUFFIX:-}
     ;;
+    # Clang of a specific version. We will download our pre-built LLVM package if necessary.
     clang*)
       if [[ -n ${YB_LLVM_TOOLCHAIN_DIR:-} ]]; then
         cc_executable=$YB_LLVM_TOOLCHAIN_DIR/bin/clang
@@ -1110,7 +1142,7 @@ find_compiler_by_type() {
               "(possibly applying 'which' expansion): $compiler_path" \
               "(trying to use compiler type '$YB_COMPILER_TYPE')."
       fi
-      eval $compiler_var_name=\"$compiler_path\"
+      eval $compiler_var_name=\""$compiler_path"\"
     fi
   done
 
@@ -1182,7 +1214,7 @@ download_and_extract_archive() {
           log "[Host $(hostname)] $FLOCK_MSG: $lock_path, proceeding with archive installation."
           (
             set -x
-            "$YB_SRC_ROOT/python/yb/download_and_extract_archive.py" \
+            "$YB_SCRIPT_PATH_DOWNLOAD_AND_EXTRACT_ARCHIVE" \
               --url "$url" \
               --dest-dir-parent "$dest_dir_parent" \
               --local-cache-dir "$LOCAL_DOWNLOAD_DIR"
@@ -1221,8 +1253,21 @@ download_thirdparty() {
   download_toolchain
 }
 
+create_llvm_toolchain_symlink() {
+  local symlink_path=${BUILD_ROOT}/toolchain
+  if [[ ${YB_SKIP_LLVM_TOOLCHAIN_SYMLINK_CREATION:-0} != "1" &&
+        -n ${YB_LLVM_TOOLCHAIN_DIR:-} &&
+        ! -L ${symlink_path} ]]; then
+    if ! ln -s "${YB_LLVM_TOOLCHAIN_DIR}" "${symlink_path}" &&
+       # If someone else created this symlink in the meantime, that's OK.
+       [[ ! -L ${symlink_path} ]]; then
+      fatal "Could not create symlink from ${symlink_path} to ${YB_LLVM_TOOLCHAIN_DIR}"
+    fi
+  fi
+}
+
 download_toolchain() {
-  expect_vars_to_be_set YB_COMPILER_TYPE
+  expect_vars_to_be_set YB_COMPILER_TYPE YB_THIRDPARTY_DIR
   local toolchain_urls=()
   local linuxbrew_url=""
   if [[ -n ${YB_THIRDPARTY_DIR:-} && -f "$YB_THIRDPARTY_DIR/linuxbrew_url.txt" ]]; then
@@ -1232,27 +1277,42 @@ download_toolchain() {
           -n ${YB_THIRDPARTY_DIR:-} && ${YB_THIRDPARTY_DIR##*/} == *linuxbrew* ]]; then
     # TODO: get rid of the hard-coded URL below and always include linuxbrew_url.txt in the
     # thirdparty archives that are built for Linuxbrew.
-    local linuxbrew_url="https://github.com/yugabyte/brew-build/releases/download/"
+    linuxbrew_url="https://github.com/yugabyte/brew-build/releases/download/"
     linuxbrew_url+="20181203T161736v9/linuxbrew-20181203T161736v9.tar.gz"
-  else
-    for file_name_part in linuxbrew toolchain; do
-      local url_file_path="$YB_THIRDPARTY_DIR/${file_name_part}_url.txt"
-      if [[ -f $url_file_path ]]; then
-        toolchain_urls+=( "$(<"$url_file_path")" )
-        break
-      fi
-    done
   fi
 
   if [[ -n ${linuxbrew_url:-} ]]; then
     toolchain_urls+=( "$linuxbrew_url" )
   fi
   if [[ -z ${YB_LLVM_TOOLCHAIN_URL:-} &&
+        -z ${YB_LLVM_TOOLCHAIN_DIR:-} &&
         ${YB_COMPILER_TYPE:-} =~ ^clang[0-9]+$ ]]; then
-    YB_LLVM_TOOLCHAIN_URL=$(
-      activate_virtualenv &>/dev/null
-      python3 -m llvm_installer --print-url "--llvm-major-version=${YB_COMPILER_TYPE#clang}"
-    )
+    local llvm_major_version=${YB_COMPILER_TYPE#clang}
+    if [[ ${build_type} =~ ^(asan|tsan)$ ]]; then
+      # For ASAN and possibly TSAN builds, we need to use the same LLVM toolchain that was used
+      # to build the third-party dependencies, so that the compiler-rt libraries match.
+      local thirdparty_llvm_url_file_path=${YB_THIRDPARTY_DIR}/toolchain_url.txt
+      if [[ -e $thirdparty_llvm_url_file_path ]]; then
+        YB_LLVM_TOOLCHAIN_URL=$(<"$thirdparty_llvm_url_file_path")
+        if [[ ${YB_LLVM_TOOLCHAIN_URL} != */yb-llvm-v${llvm_major_version}.* ]]; then
+          fatal "LLVM toolchain URL ${YB_LLVM_TOOLCHAIN_URL} from the third-party directory" \
+                "${YB_THIRDPARTY_DIR} does not match the compiler type ${YB_COMPILER_TYPE}:" \
+                "${YB_LLVM_TOOLCHAIN_URL}"
+        fi
+      else
+        log "Warning: could not find ${thirdparty_llvm_url_file_path}, will try to use the" \
+            "llvm-installer utility to determine the LLVM toolchain URL to download. Note that a" \
+            "mismatch between LLVM versions used to build yugabyte-db-thirdparty and YugabyteDB" \
+            "can cause ASAN/TSAN tests to fail."
+      fi
+    fi
+
+    if [[ -z ${YB_LLVM_TOOLCHAIN_URL:-} ]]; then
+      YB_LLVM_TOOLCHAIN_URL=$(
+        activate_virtualenv &>/dev/null
+        python3 -m llvm_installer --print-url "--llvm-major-version=$llvm_major_version"
+      )
+    fi
     if [[ ${YB_LLVM_TOOLCHAIN_URL} != https://* ]]; then
       fatal "Failed to determine LLVM toolchain URL using the llvm-installer utility." \
             "YB_LLVM_TOOLCHAIN_URL=${YB_LLVM_TOOLCHAIN_URL}. See" \
@@ -1263,6 +1323,7 @@ download_toolchain() {
   if [[ -n ${YB_LLVM_TOOLCHAIN_URL:-} ]]; then
     toolchain_urls+=( "${YB_LLVM_TOOLCHAIN_URL}" )
   fi
+  create_llvm_toolchain_symlink
 
   if [[ ${#toolchain_urls[@]} -eq 0 ]]; then
     return
@@ -1298,24 +1359,27 @@ download_toolchain() {
 
     if [[ ${is_llvm} == "true" ]]; then
       if [[ -n ${YB_LLVM_TOOLCHAIN_DIR:-} &&
-            $YB_LLVM_TOOLCHAIN_DIR != "$extracted_dir" &&
-            ${YB_LLVM_TOOLCHAIN_DIR_MISMATCH_WARNING_LOGGED:-0} == "0" ]]; then
-        log_thirdparty_and_toolchain_details
-        log "Warning: YB_LLVM_TOOLCHAIN_DIR is already set to '$YB_LLVM_TOOLCHAIN_DIR', cannot " \
-            "set it to '$extracted_dir'. This may happen in case the LLVM toolchain version used " \
-            "to built third-party dependencies is different from the most recent one for the " \
-            "same major version that we have just picked to build YugabyteDB with."
-        export YB_LLVM_TOOLCHAIN_DIR_MISMATCH_WARNING_LOGGED=1
+            ${YB_LLVM_TOOLCHAIN_DIR} != "${extracted_dir}" ]]; then
+        if [[ ${YB_LLVM_TOOLCHAIN_MISMATCH_WARNING_LOGGED:-0} == "0" &&
+              ${YB_SUPPRESS_LLVM_TOOLCHAIN_MISMATCH_WARNING:-0} != "1" ]]; then
+          log_thirdparty_and_toolchain_details
+          log "Warning: YB_LLVM_TOOLCHAIN_DIR is already set to '${YB_LLVM_TOOLCHAIN_DIR}'," \
+              "cannot set it to '${extracted_dir}'. This may happen in case the LLVM toolchain" \
+              "version used to build third-party dependencies is different from the one we are" \
+              "using now to build YugabyteDB, normally determined by the llvm-installer Python" \
+              "module. To fix this permanently, third-party dependencies should be rebuilt using" \
+              "our most recent build of the LLVM toolchain for this major version, but in most" \
+              "cases this is not a problem. To suppress this warning, set the" \
+              "YB_SUPPRESS_LLVM_TOOLCHAIN_MISMATCH_WARNING env var to 1."
+          export YB_LLVM_TOOLCHAIN_MISMATCH_WARNING_LOGGED=1
+        fi
+      else
+        export YB_LLVM_TOOLCHAIN_DIR=$extracted_dir
+        yb_llvm_toolchain_dir_origin="downloaded from $toolchain_url"
+        save_llvm_toolchain_info_to_build_dir
       fi
-      export YB_LLVM_TOOLCHAIN_DIR=$extracted_dir
-      yb_llvm_toolchain_dir_origin="downloaded from $toolchain_url"
-      save_llvm_toolchain_info_to_build_dir
     fi
   done
-
-  if [[ -n ${YB_LLVM_TOOLCHAIN_DIR:-} && ! -e ${BUILD_ROOT}/toolchain ]]; then
-    ln -s "${YB_LLVM_TOOLCHAIN_DIR}" "${BUILD_ROOT}/toolchain"
-  fi
 }
 
 # -------------------------------------------------------------------------------------------------
@@ -1538,6 +1602,13 @@ add_brew_bin_to_path() {
   fi
 }
 
+remove_linuxbrew_bin_from_path() {
+  if using_linuxbrew; then
+    ensure_linuxbrew_dir_is_set
+    remove_path_entry "$YB_LINUXBREW_DIR/bin"
+  fi
+}
+
 detect_num_cpus() {
   if [[ ! ${YB_NUM_CPUS:-} =~ ^[0-9]+$ ]]; then
     if is_linux; then
@@ -1557,7 +1628,7 @@ detect_num_cpus() {
 # Gets a random build worker host name. Output variable: build_workers (array).
 # shellcheck disable=SC2120
 get_build_worker_list() {
-  expect_num_args 0 "$@"
+  expect_no_args "$#"
   if [[ -z ${YB_BUILD_WORKERS_LIST_URL:-} ]]; then
     fatal "YB_BUILD_WORKERS_LIST_URL not set"
   fi
@@ -1575,7 +1646,9 @@ get_build_worker_list() {
     if [[ -n ${YB_BUILD_WORKERS_FILE:-} ]]; then
       build_workers=( $( cat "$YB_BUILD_WORKERS_FILE" ))
     else
-      build_workers=( $( curl -s "$YB_BUILD_WORKERS_LIST_URL" ) )
+      build_workers=( $( curl -s "$YB_BUILD_WORKERS_LIST_URL" ) ) \
+        || fatal "Failed to curl $YB_BUILD_WORKERS_LIST_URL: check your network connection or use" \
+                 "--no-remote"
     fi
     if [[ ${#build_workers[@]} -eq 0 ]]; then
       log "Got an empty list of build workers from $YB_BUILD_WORKERS_LIST_URL," \
@@ -1962,7 +2035,7 @@ handle_predefined_build_root_quietly=false
 
 # shellcheck disable=SC2120
 handle_predefined_build_root() {
-  expect_num_args 0 "$@"
+  expect_no_args "$#"
   if [[ -z ${predefined_build_root:-} ]]; then
     return
   fi
@@ -1978,7 +2051,7 @@ handle_predefined_build_root() {
   if [[ $predefined_build_root != $YB_BUILD_INTERNAL_PARENT_DIR/* && \
         $predefined_build_root != $YB_BUILD_EXTERNAL_PARENT_DIR/* ]]; then
     # Sometimes $predefined_build_root contains symlinks on its path.
-    "$YB_SRC_ROOT/build-support/validate_build_root.py" \
+    "$YB_SCRIPT_PATH_VALIDATE_BUILD_ROOT" \
       "$predefined_build_root" \
       "$YB_BUILD_INTERNAL_PARENT_DIR" \
       "$YB_BUILD_EXTERNAL_PARENT_DIR"
@@ -2014,7 +2087,7 @@ handle_predefined_build_root() {
 
   if [[ -z ${build_type:-} ]]; then
     build_type=$_build_type
-    if ! "$handle_predefined_build_root_quietly"; then
+    if [[ ${handle_predefined_build_root_quietly} == "false" ]]; then
       log "Setting build type to '$build_type' based on predefined build root ('$basename')"
     fi
     validate_build_type "$build_type"
@@ -2025,7 +2098,7 @@ handle_predefined_build_root() {
 
   if [[ -z ${YB_COMPILER_TYPE:-} ]]; then
     export YB_COMPILER_TYPE=$_compiler_type
-    if ! "$handle_predefined_build_root_quietly"; then
+    if [[ ${handle_predefined_build_root_quietly} == "false" ]]; then
       log "Automatically setting compiler type to '$YB_COMPILER_TYPE' based on predefined build" \
           "root ('$basename')"
     fi
@@ -2036,7 +2109,7 @@ handle_predefined_build_root() {
 
   if [[ -z ${YB_LINKING_TYPE:-} ]]; then
     export YB_LINKING_TYPE=$_linking_type
-    if ! "$handle_predefined_build_root_quietly"; then
+    if [[ ${handle_predefined_build_root_quietly} == "false" ]]; then
       log "Automatically setting linking type to '$YB_LINKING_TYPE' based on predefined build" \
           "root ('$basename')"
     fi
@@ -2077,7 +2150,7 @@ handle_predefined_build_root() {
   else
     should_use_ninja=0
   fi
-  if ! "$handle_predefined_build_root_quietly"; then
+  if [[ $handle_predefined_build_root_quietly == "false" ]]; then
     log "Setting YB_USE_NINJA to 1 based on predefined build root ('$basename')"
   fi
   if [[ -n ${YB_USE_NINJA:-} && $YB_USE_NINJA != "$should_use_ninja" ]]; then
@@ -2121,7 +2194,7 @@ set_test_invocation_id() {
 # Kills any processes that have YB_TEST_INVOCATION_ID in their command line. Sets
 # killed_stuck_processes=true in case that happens.
 kill_stuck_processes() {
-  expect_num_args 0 "$@"
+  expect_no_args "$#"
   killed_stuck_processes=false
   if [[ -z ${YB_TEST_INVOCATION_ID:-} ]]; then
     return
@@ -2192,49 +2265,59 @@ check_python_script_syntax() {
   git ls-files -t '*.py' \
     | grep -v '^S' \
     | sed 's/^[[:alpha:]] //' \
-    | xargs -P 8 -n 1 "$YB_BUILD_SUPPORT_DIR/check_python_syntax.py"
-  popd
+    | xargs -P 8 -n 1 "$YB_SCRIPT_PATH_CHECK_PYTHON_SYNTAX"
+  popd +0
 }
 
 run_shellcheck() {
-  local scripts_to_check=(
-    yb_build.sh
-    build-support/find_linuxbrew.sh
-    build-support/common-build-env.sh
-    build-support/common-test-env.sh
-    build-support/common-cli-env.sh
-    build-support/run-test.sh
-    build-support/compiler-wrappers/compiler-wrapper.sh
-  )
   pushd "$YB_SRC_ROOT"
+  local scripts_to_check=(
+    bin/*.sh
+    build-support/*.sh
+    build-support/jenkins/*.sh
+    yb_build.sh
+    yugabyted-ui/build.sh
+  )
   local script_path
   local shellcheck_had_errors=false
+  if shellcheck --version | grep -q '^version: 0.3'; then
+    # Centos7 distro has old version of shellcheck that does not support --external-sources.
+    log "Warning: Skipping shellcheck. Requires at least version 0.4.0."
+    popd +0
+    return 0
+  fi
+  # We skip errors 2030 and 2031 that say that a variable has been modified in a subshell and that
+  # the modification is local to the subshell. Seeing a lot of false positivies for these with
+  # the version 0.7.2 of Shellcheck.
+  # SC2230 (avoid 'which" command) is supposed to be optional check, but enabled in some distros.
+  local excodes="2030,2031,2230"
   for script_path in "${scripts_to_check[@]}"; do
-    # We skip errors 2030 and 2031 that say that a variable has been modified in a subshell and that
-    # the modification is local to the subshell. Seeing a lot of false positivies for these with
-    # the version 0.7.2 of Shellcheck.
-    if ! ( set -x; shellcheck --external-sources --exclude=2030,2031 --shell=bash "$script_path" )
+    if ! ( set -x; shellcheck --external-sources --exclude="$excodes" --shell=bash "$script_path" )
     then
       shellcheck_had_errors=true
     fi
   done
-  popd
+  popd +0
   if [[ $shellcheck_had_errors == "true" ]]; then
     exit 1
   fi
 }
 
 activate_virtualenv() {
+  detect_architecture
+
   local virtualenv_parent_dir=$YB_BUILD_PARENT_DIR
   local virtualenv_dir=$virtualenv_parent_dir/$YB_VIRTUALENV_BASENAME
 
   # On Apple Silicon, use separate virtualenv directories per architecture.
-  if is_apple_silicon && [[ -n ${YB_TARGET_ARCH:-} ]]; then
+  if is_apple_silicon; then
+    detect_architecture
     virtualenv_dir+="-${YB_TARGET_ARCH}"
   fi
 
-  if [[ ${YB_RECREATE_VIRTUALENV:-} == "1" && -d $virtualenv_dir ]] && \
-     ! "$yb_readonly_virtualenv"; then
+  if [[ ${YB_RECREATE_VIRTUALENV:-} == "1" &&
+        -d $virtualenv_dir &&
+        ${yb_readonly_virtualenv} == "false" ]]; then
     log "YB_RECREATE_VIRTUALENV is set, deleting virtualenv at '$virtualenv_dir'"
     rm -rf "$virtualenv_dir"
     # We don't want to be re-creating the virtual environment over and over again.
@@ -2263,11 +2346,35 @@ activate_virtualenv() {
       mkdir -p "$virtualenv_parent_dir"
       cd "$virtualenv_parent_dir"
       local python3_interpreter=python3
-      if is_mac && [[ ${YB_TARGET_ARCH:-} == "arm64" ]]; then
-        python3_interpreter=/opt/homebrew/bin/python3
+      local arch_prefix=""
+      if is_apple_silicon; then
+        # On Apple Silicon, use the system Python 3 interpreter. This is necessary because the
+        # Homebrew Python was upgraded to version 3.11 in April 2023, and setup.py fails for
+        # the typed-ast module.
+        python3_interpreter=/usr/bin/python3
+        arch_prefix="arch -${YB_TARGET_ARCH}"
       fi
-      set -x
-      "$python3_interpreter" -m venv "${virtualenv_dir##*/}"
+
+      # Require Python version at least 3.7.
+      local python3_version
+      python3_version=$( "$python3_interpreter" -V )
+      if [ "$(echo "$python3_version" | cut -d. -f2)" -lt 7 ]; then
+        fatal "Python version too low: $python3_version"
+      fi
+
+      $arch_prefix "$python3_interpreter" -m venv "${virtualenv_dir##*/}"
+
+      # Validate the architecture of the virtualenv.
+      if [[ -n ${YB_TARGET_ARCH:-} ]]; then
+        local actual_python_arch
+        actual_python_arch=$(
+          "${virtualenv_dir}/bin/python3" -c "import platform; print(platform.machine())"
+        )
+        if [[ $actual_python_arch != "$YB_TARGET_ARCH" ]]; then
+          fatal "Failed to create virtualenv for $YB_TARGET_ARCH, got $actual_python_arch instead" \
+                "for virtualenv at $virtualenv_dir"
+        fi
+      fi
     )
   fi
 
@@ -2281,9 +2388,10 @@ activate_virtualenv() {
   fi
 
   local pip_executable=pip3
-  if ! "$yb_readonly_virtualenv"; then
+  if [[ ${yb_readonly_virtualenv} == "false" ]]; then
     local requirements_file_path="$YB_SRC_ROOT/requirements_frozen.txt"
     local installed_requirements_file_path=$virtualenv_dir/${requirements_file_path##*/}
+    "$pip_executable" --retries 0 install --upgrade pip
     if ! cmp --silent "$requirements_file_path" "$installed_requirements_file_path"; then
       run_with_retries 10 0.5 "$pip_executable" install -r "$requirements_file_path" \
         $pip_no_cache
@@ -2399,15 +2507,17 @@ lint_java_code() {
              "$java_test_file" &&
          ! grep -Eq '@RunWith\((value[ ]*=[ ]*)?YBTestRunnerNonSanitizersOrMac\.class\)' \
              "$java_test_file" &&
-         ! grep -Eq '@RunWith\((value[ ]*=[ ]*)?YBTestRunnerNonSanitizersOrAArch64\.class\)' \
+         ! grep -Eq '@RunWith\((value[ ]*=[ ]*)?YBTestRunnerNonSanOrAArch64Mac\.class\)' \
              "$java_test_file" &&
          ! grep -Eq '@RunWith\((value[ ]*=[ ]*)?YBTestRunnerReleaseOnly\.class\)' \
+             "$java_test_file" &&
+         ! grep -Eq '@RunWith\((value[ ]*=[ ]*)?YBTestRunnerYsqlConnMgr\.class\)' \
              "$java_test_file"
       then
         log "$log_prefix: neither YBTestRunner, YBParameterizedTestRunner, " \
             "YBTestRunnerNonTsanOnly, YBTestRunnerNonTsanAsan, YBTestRunnerNonSanitizersOrMac, " \
-            "YBTestRunnerNonSanitizersOrAArch64, " \
-            "nor YBTestRunnerReleaseOnly are being used in test"
+            "YBTestRunnerNonSanOrAArch64Mac, " \
+            "YBTestRunnerReleaseOnly, nor YBTestRunnerYsqlConnMgr are being used in test"
         num_errors+=1
       fi
       if grep -Fq 'import static org.junit.Assert' "$java_test_file" ||
@@ -2492,7 +2602,7 @@ set_prebuilt_thirdparty_url() {
       local thirdparty_tool_cmd_line=(
         "$YB_BUILD_SUPPORT_DIR/thirdparty_tool"
         --save-thirdparty-url-to-file "$thirdparty_url_file_path"
-        --compiler-type "$YB_COMPILER_TYPE"
+        --compiler-type "${YB_COMPILER_TYPE_FOR_THIRDPARTY:-$YB_COMPILER_TYPE}"
       )
       if [[ -n ${YB_USE_LINUXBREW:-} ]]; then
         # See arg_str_to_bool in Python code for how the boolean parameter is interpreted.
@@ -2501,6 +2611,9 @@ set_prebuilt_thirdparty_url() {
       if [[ ${YB_LINKING_TYPE:-dynamic} != "dynamic" ]]; then
         # Transform "thin-lto" or "full-lto" into "thin" or "full" respectively.
         thirdparty_tool_cmd_line+=( "--lto=${YB_LINKING_TYPE%%-lto}" )
+      fi
+      if [[ ! ${build_type} =~ ^(asan|tsan)$ && ${YB_COMPILER_TYPE} == clang* ]]; then
+        thirdparty_tool_cmd_line+=( "--allow-older-os" )
       fi
       "${thirdparty_tool_cmd_line[@]}"
       YB_THIRDPARTY_URL=$(<"$BUILD_ROOT/thirdparty_url.txt")
@@ -2650,14 +2763,32 @@ build_clangd_index() {
   log "Building Clangd index at ${clangd_index_path}"
   (
     set -x
+    # The location of the final compilation database file needs to be consistent with that in the
+    # compile_commands.py module.
     time "${YB_LLVM_TOOLCHAIN_DIR}/bin/clangd-indexer" \
         --executor=all-TUs \
         "--format=${format}" \
-        "${BUILD_ROOT}/compile_commands.json" \
+        "${BUILD_ROOT}/compile_commands/combined_postprocessed/compile_commands.json" \
         >"${clangd_index_path}"
   )
 }
 
+adjust_compiler_type_on_mac() {
+  # A workaround for old macOS build workers where the default Clang version is 13 or older.
+  if is_mac &&
+    ! is_apple_silicon &&
+    [[ ${YB_COMPILER_TYPE:-clang} == "clang" &&
+       -f /usr/bin/clang &&
+       $(clang --version) =~ clang\ version\ ([0-9]+) ]]
+  then
+    clang_major_version=${BASH_REMATCH[1]}
+    if [[ ${clang_major_version} -lt 14 ]]; then
+      export YB_COMPILER_TYPE=clang14
+      # Used in common-build-env-test.sh to avoid failing when the compiler type is adjusted.
+      export YB_COMPILER_TYPE_WAS_ADJUSTED=true
+    fi
+  fi
+}
 
 # -------------------------------------------------------------------------------------------------
 # Initialization

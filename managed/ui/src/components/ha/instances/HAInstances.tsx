@@ -1,34 +1,51 @@
 import _ from 'lodash';
-import React, { FC, ReactElement, useState } from 'react';
+import { FC, ReactElement, useState } from 'react';
 import { Col, Grid, Row } from 'react-bootstrap';
 import { BootstrapTable, TableHeaderColumn } from 'react-bootstrap-table';
+import moment from 'moment-timezone';
+
 import { YBButton } from '../../common/forms/fields';
 import { useLoadHAConfiguration } from '../hooks/useLoadHAConfiguration';
-import { AddStandbyInstanceModal } from '../modals/AddStandbyInstanceModal';
 import { YBLoading } from '../../common/indicators';
 import { HAErrorPlaceholder } from '../compounds/HAErrorPlaceholder';
-import { HAPlatformInstance } from '../../../redesign/helpers/dtos';
 import { DeleteModal } from '../modals/DeleteModal';
 import { PromoteInstanceModal } from '../modals/PromoteInstanceModal';
 import { BadgeInstanceType } from '../compounds/BadgeInstanceType';
-import './HAInstances.scss';
-import { timeFormatter } from '../../../utils/TableFormatters';
+import { AddStandbyInstanceModal } from '../modals/AddStandbyInstanceModal';
+import { formatDuration } from '../../../utils/Formatters';
 
-const renderAddress = (cell: any, row: HAPlatformInstance): ReactElement => (
+import { HaInstanceState, HaPlatformInstance } from '../dtos';
+
+import './HAInstances.scss';
+import { HAInstanceStatelabel } from '../compounds/HAInstanceStateLabel';
+
+interface HAInstancesProps {
+  // Dispatch
+  fetchRuntimeConfigs: () => void;
+  setRuntimeConfig: (key: string, value: string) => void;
+  // State
+  runtimeConfigs: any;
+}
+
+const renderAddress = (cell: any, row: HaPlatformInstance): ReactElement => (
   <a href={row.address} target="_blank" rel="noopener noreferrer">
     {row.address}
     {row.is_local && <span className="badge badge-orange">Current</span>}
   </a>
 );
 
-const renderInstanceType = (cell: HAPlatformInstance['is_leader']): ReactElement => (
+const renderInstanceType = (cell: HaPlatformInstance['is_leader']): ReactElement => (
   <BadgeInstanceType isActive={cell} />
 );
 
-const renderLastBackup = (cell: HAPlatformInstance['last_backup']): ReactElement | string =>
-  cell ? timeFormatter(cell) : 'n/a';
+const renderBackupLag = (cell: HaPlatformInstance['last_backup']): ReactElement | string =>
+  cell ? formatDuration(moment.duration(moment().diff(moment(cell))).asMilliseconds()) : 'n/a';
 
-export const HAInstances: FC = () => {
+export const HAInstances: FC<HAInstancesProps> = ({
+  fetchRuntimeConfigs,
+  setRuntimeConfig,
+  runtimeConfigs
+}) => {
   const [isAddInstancesModalVisible, setAddInstancesModalVisible] = useState(false);
   const [instanceToDelete, setInstanceToDelete] = useState<string>();
   const [instanceToPromote, setInstanceToPromote] = useState<string>();
@@ -46,7 +63,7 @@ export const HAInstances: FC = () => {
 
   const currentInstance = config?.instances.find((item) => item.is_local);
 
-  const renderActions = (cell: any, row: HAPlatformInstance): ReactElement => {
+  const renderActions = (cell: any, row: HaPlatformInstance): ReactElement => {
     if (currentInstance?.is_leader) {
       return (
         <YBButton
@@ -57,6 +74,7 @@ export const HAInstances: FC = () => {
         />
       );
     } else {
+      // eslint-disable-next-line no-lonely-if
       if (row.is_local) {
         return (
           <YBButton
@@ -78,7 +96,8 @@ export const HAInstances: FC = () => {
   }
 
   if (error) {
-    return <HAErrorPlaceholder error={error} configUUID={config?.uuid!}/>;
+    // eslint-disable-next-line @typescript-eslint/no-non-null-asserted-optional-chain
+    return <HAErrorPlaceholder error={error} configUUID={config?.uuid!} />;
   }
 
   if (isNoHAConfigExists) {
@@ -98,6 +117,9 @@ export const HAInstances: FC = () => {
           configId={config.uuid}
           visible={isAddInstancesModalVisible}
           onClose={hideAddInstancesModal}
+          fetchRuntimeConfigs={fetchRuntimeConfigs}
+          setRuntimeConfig={setRuntimeConfig}
+          runtimeConfigs={runtimeConfigs}
         />
         <DeleteModal
           configId={config.uuid}
@@ -138,30 +160,40 @@ export const HAInstances: FC = () => {
                 dataField="address"
                 dataFormat={renderAddress}
                 dataSort
-                width="40%"
+                width="30%"
               >
                 Address
+              </TableHeaderColumn>
+              <TableHeaderColumn
+                dataField="instance_state"
+                dataFormat={(_: HaInstanceState, haInstance: HaPlatformInstance) => (
+                  <HAInstanceStatelabel haInstance={haInstance} />
+                )}
+                dataSort
+                width="17.5%"
+              >
+                Instance State
               </TableHeaderColumn>
               <TableHeaderColumn
                 dataField="is_leader"
                 dataFormat={renderInstanceType}
                 dataSort
-                width="20%"
+                width="17.5%"
               >
                 Type
               </TableHeaderColumn>
               <TableHeaderColumn
                 dataField="last_backup"
-                dataFormat={renderLastBackup}
+                dataFormat={renderBackupLag}
                 dataSort
-                width="20%"
+                width="17.5%"
               >
-                Last Backup Time
+                Time since last backup
               </TableHeaderColumn>
               <TableHeaderColumn
                 columnClassName="yb-actions-cell"
                 dataFormat={renderActions}
-                width="20%"
+                width="17.5%"
               >
                 Action
               </TableHeaderColumn>

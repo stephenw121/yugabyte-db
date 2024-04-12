@@ -10,7 +10,6 @@
 
 package com.yugabyte.yw.common;
 
-import akka.stream.Materializer;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import com.typesafe.config.Config;
@@ -19,6 +18,7 @@ import com.typesafe.config.ConfigValue;
 import com.yugabyte.yw.common.config.RuntimeConfigFactory;
 import java.util.concurrent.CompletableFuture;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.pekko.stream.Materializer;
 import play.Environment;
 import play.inject.ApplicationLifecycle;
 import play.libs.ws.WSClient;
@@ -54,16 +54,16 @@ public class CustomWsClientFactory {
             .withOnlyPath("play.ws");
     // Enable trace level logging to debug actual config value being resolved:
     log.trace("Creating ws client with config: {}", customWsConfig.root().render());
-    AhcWSClient customeWsClient =
+    AhcWSClient customWsClient =
         AhcWSClient.create(
             AhcWSClientConfigFactory.forConfig(customWsConfig, environment.classLoader()),
             null, // no HTTP caching
             materializer);
     lifecycle.addStopHook(
         () -> {
-          customeWsClient.close();
+          customWsClient.close();
           return CompletableFuture.completedFuture(null);
         });
-    return customeWsClient;
+    return customWsClient;
   }
 }

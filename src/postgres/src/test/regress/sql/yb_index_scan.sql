@@ -19,13 +19,28 @@ SELECT * FROM pk_desc ORDER BY k DESC;
 EXPLAIN (COSTS OFF) SELECT * FROM pk_desc ORDER BY k NULLS FIRST;
 SELECT * FROM pk_desc ORDER BY k NULLS FIRST;
 
+-- Testing yb_pushdown_strict_inequality
+SELECT k FROM pk_desc WHERE k < 30 AND k > 10;
+/*+Set(yb_pushdown_strict_inequality false)*/ SELECT k FROM pk_desc WHERE k < 30 AND k > 10;
+
 CREATE TABLE  pk_multi(h int, r int, v text, PRIMARY KEY(h, r DESC));
 INSERT INTO pk_multi(h, r, v) VALUES (1, 0, '1-0'),(1, 1, '1-1'),(1, 2, '1-2'),(1, 3, '1-3');
 EXPLAIN (COSTS OFF) SELECT * FROM pk_multi WHERE h = 1;
 SELECT * FROM pk_multi WHERE h = 1;
 
+-- We should still get correct results even if hash key is unset
+/*+IndexScan(pk_multi pk_multi_pkey)*/ EXPLAIN (COSTS OFF) SELECT * FROM pk_multi WHERE r IN (5,3,9,2);
+/*+IndexScan(pk_multi pk_multi_pkey)*/ SELECT * FROM pk_multi WHERE r IN (5,3,9,2);
+
 EXPLAIN (COSTS OFF) SELECT * FROM pk_multi WHERE yb_hash_code(h) = yb_hash_code(1);
 SELECT * FROM pk_multi WHERE yb_hash_code(h) = yb_hash_code(1);
+
+-- Test yb_pushdown_is_not_null
+CREATE TABLE inn_hash(k int PRIMARY KEY, v int) SPLIT INTO 1 TABLETS;
+CREATE INDEX ON inn_hash(v ASC);
+INSERT INTO inn_hash VALUES (1,NULL),(2,102),(3,NULL),(4,104),(5,105),(6,NULL);
+SELECT * FROM inn_hash WHERE v IS NOT NULL;
+/*+Set(yb_pushdown_is_not_null false)*/ SELECT * FROM inn_hash WHERE v IS NOT NULL;
 
 -- Test unique secondary index ordering
 CREATE TABLE usc_asc(k int, v int);
@@ -38,7 +53,7 @@ SELECT * FROM usc_asc ORDER BY v DESC NULLS LAST;
 EXPLAIN (COSTS OFF) SELECT * FROM usc_asc ORDER BY v NULLS FIRST;
 SELECT * FROM usc_asc ORDER BY v NULLS FIRST;
 
-CREATE TABLE usc_multi_asc(k int, r int, v int);
+CREATE TABLE usc_multi_asc(k int, r int, v int) SPLIT INTO 1 TABLETS;
 CREATE INDEX ON usc_multi_asc(k, r ASC NULLS FIRST);
 INSERT INTO usc_multi_asc(k, r, v) VALUES (1, 10, 1),(1, NULL, 2),(1, 20, 3);
 EXPLAIN (COSTS OFF) SELECT * FROM usc_multi_asc WHERE k = 1;
@@ -55,7 +70,7 @@ SELECT * FROM sc_desc ORDER BY v DESC NULLS LAST;
 EXPLAIN (COSTS OFF) SELECT * FROM sc_desc ORDER BY v NULLS FIRST;
 SELECT * FROM sc_desc ORDER BY v NULLS FIRST;
 
-CREATE TABLE sc_multi_desc(k int, r int, v int);
+CREATE TABLE sc_multi_desc(k int, r int, v int) SPLIT INTO 1 TABLETS;
 CREATE INDEX ON sc_multi_desc(k, r DESC);
 INSERT INTO sc_multi_desc(k, r, v) VALUES (1, 10, 10),(1, 10, 10),(1, NULL, 2),(1, 20, 3);
 EXPLAIN (COSTS OFF) SELECT * FROM sc_multi_desc WHERE k = 1;
@@ -67,7 +82,7 @@ EXPLAIN SELECT v,r FROM sc_multi_desc WHERE v IN (2,4) and r is null;
 SELECT v,r FROM sc_multi_desc WHERE v IN (2,4) and r is null;
 
 -- Test NULLS last ordering.
-CREATE TABLE sc_desc_nl(h int, r int, v int);
+CREATE TABLE sc_desc_nl(h int, r int, v int) SPLIT INTO 1 TABLETS;
 CREATE INDEX on sc_desc_nl(h HASH, r DESC NULLS LAST);
 INSERT INTO sc_desc_nl(h,r,v) values (1,1,1), (1,2,2), (1,3,3), (1,4,4), (1,5,5), (1, null, 6);
 -- Rows should be ordered DESC NULLS LAST by r.
@@ -100,73 +115,6 @@ SELECT * FROM sc_desc_nl WHERE yb_hash_code(h) = yb_hash_code(1) AND r IS null;
 EXPLAIN (COSTS OFF) SELECT * FROM sc_desc_nl WHERE yb_hash_code(h) = yb_hash_code(1) AND r IS null;
 
 DROP TABLE sc_desc_nl;
-
---
--- Test complex systable scans.
---
-
--- Existing db oid (template1).
-SELECT * FROM pg_database WHERE datname = (SELECT datname FROM pg_database WHERE oid = 1);
-SELECT * FROM pg_database WHERE datname IN (SELECT datname FROM pg_database WHERE oid = 1);
-
--- Invalid (non-existing) db.
-SELECT * FROM pg_database WHERE datname = (SELECT datname FROM pg_database WHERE oid = 0);
-SELECT * FROM pg_database WHERE datname IN (SELECT datname FROM pg_database WHERE oid = 0);
-
--- This is a query done by the pg_admin dashboard, testing compatiblity here.
-
--- Existing db oid (template1).
-SELECT 'session_stats' AS chart_name, row_to_json(t) AS chart_data
-FROM (SELECT
-   (SELECT count(*) FROM pg_stat_activity WHERE datname = (SELECT datname FROM pg_database WHERE oid = 1)) AS "Total",
-   (SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND datname = (SELECT datname FROM pg_database WHERE oid = 1))  AS "Active",
-   (SELECT count(*) FROM pg_stat_activity WHERE state = 'idle' AND datname = (SELECT datname FROM pg_database WHERE oid = 1))  AS "Idle"
-) t
-UNION ALL
-SELECT 'tps_stats' AS chart_name, row_to_json(t) AS chart_data
-FROM (SELECT
-   (SELECT sum(xact_commit) + sum(xact_rollback) FROM pg_stat_database WHERE datname = (SELECT datname FROM pg_database WHERE oid = 1)) AS "Transactions",
-   (SELECT sum(xact_commit) FROM pg_stat_database WHERE datname = (SELECT datname FROM pg_database WHERE oid = 1)) AS "Commits",
-   (SELECT sum(xact_rollback) FROM pg_stat_database WHERE datname = (SELECT datname FROM pg_database WHERE oid = 1)) AS "Rollbacks"
-) t;
-
--- Invalid (non-existing) db.
-SELECT 'session_stats' AS chart_name, row_to_json(t) AS chart_data
-FROM (SELECT
-   (SELECT count(*) FROM pg_stat_activity WHERE datname = (SELECT datname FROM pg_database WHERE oid = 0)) AS "Total",
-   (SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND datname = (SELECT datname FROM pg_database WHERE oid = 0))  AS "Active",
-   (SELECT count(*) FROM pg_stat_activity WHERE state = 'idle' AND datname = (SELECT datname FROM pg_database WHERE oid = 0))  AS "Idle"
-) t
-UNION ALL
-SELECT 'tps_stats' AS chart_name, row_to_json(t) AS chart_data
-FROM (SELECT
-   (SELECT sum(xact_commit) + sum(xact_rollback) FROM pg_stat_database WHERE datname = (SELECT datname FROM pg_database WHERE oid = 0)) AS "Transactions",
-   (SELECT sum(xact_commit) FROM pg_stat_database WHERE datname = (SELECT datname FROM pg_database WHERE oid = 0)) AS "Commits",
-   (SELECT sum(xact_rollback) FROM pg_stat_database WHERE datname = (SELECT datname FROM pg_database WHERE oid = 0)) AS "Rollbacks"
-) t;
-
--- Test NULL returned by function.
-
--- Mark the function as stable to ensure pushdown.
-CREATE OR REPLACE FUNCTION test_null_pushdown()
-RETURNS Name AS $$
-BEGIN
-return null;
-END;
-$$ LANGUAGE plpgsql STABLE;
-
--- Expect pushdown in all cases.
-EXPLAIN SELECT * FROM pg_database WHERE datname = test_null_pushdown();
-EXPLAIN SELECT * FROM pg_database WHERE datname IN (test_null_pushdown());
-EXPLAIN SELECT * FROM pg_database WHERE datname IN ('template1', test_null_pushdown(), 'template0');
-
--- Test execution.
-SELECT * FROM pg_database WHERE datname = test_null_pushdown();
-SELECT * FROM pg_database WHERE datname IN (test_null_pushdown());
--- Test null mixed with valid (existing) options.
-SELECT * FROM pg_database WHERE datname IN ('template1', test_null_pushdown(), 'template0');
--- Test null(s) mixed with invalid (existing) options.
-SELECT * FROM pg_database WHERE datname IN ('non_existing_db1', test_null_pushdown(), 'non_existing_db2', test_null_pushdown());
 
 --------------------------------------
 -- Testing Selective Updation of Indices
@@ -410,6 +358,8 @@ EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT * FROM pk_range_int
 SELECT * FROM pk_range_int_desc WHERE (r1, r3) <= (1,3) AND (r1,r2) < (1,3) AND (r1,r2) >= (1,2);
 EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT * FROM pk_range_int_desc WHERE (r1, r3) <= (1,3) AND (r1,r2) < (1,3) AND (r1,r2) >= (1,2) AND (r1,r2,r3) = (1,2,3);
 SELECT * FROM pk_range_int_desc WHERE (r1, r3) <= (1,3) AND (r1,r2) < (1,3) AND (r1,r2) >= (1,2) AND (r1,r2,r3) = (1,2,3);
+EXPLAIN (COSTS OFF) SELECT * FROM pk_range_int_desc WHERE r2 IN (1,3,5) ORDER BY r1 DESC, r2 DESC LIMIT 10;
+SELECT * FROM pk_range_int_desc WHERE r2 IN (1,3,5) ORDER BY r1 DESC, r2 DESC LIMIT 10;
 DROP TABLE pk_range_int_desc;
 
 CREATE TABLE pk_range_int_text (r1 INT, r2 TEXT, r3 BIGINT, v INT, PRIMARY KEY(r1 asc, r2 asc, r3 asc));
@@ -439,4 +389,112 @@ CREATE TABLE pk_hash_range_int (h int, r1 int, r2 int, r3 int, PRIMARY KEY(h has
 INSERT INTO pk_hash_range_int SELECT i/25, (i/5) % 5, i % 5, i FROM generate_series(1, 125) AS i;
 /*+ IndexScan(pk_hash_range_int) */ EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT * FROM pk_hash_range_int WHERE (r1, r2) <= (3, 2);
 /*+ IndexScan(pk_hash_range_int) */ SELECT * FROM pk_hash_range_int WHERE (r1, r2) <= (3, 2);
+/*+ IndexScan(pk_hash_range_int) */ EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT * FROM pk_hash_range_int WHERE h = 1 AND (r1, r2) <= (3, 2) AND r1 <= 2;
+/*+ IndexScan(pk_hash_range_int) */ SELECT * FROM pk_hash_range_int WHERE h = 1 AND (r1, r2) <= (3, 2) AND r1 <= 2;
+/*+ IndexScan(pk_hash_range_int) */ EXPLAIN (COSTS OFF, TIMING OFF, SUMMARY OFF, ANALYZE) SELECT sum(r1) FROM pk_hash_range_int WHERE h = 1 AND (r1, r2) <= (3, 2) AND r1 <= 2;
+/*+ IndexScan(pk_hash_range_int) */ SELECT sum(r1) FROM pk_hash_range_int WHERE h = 1 AND (r1, r2) <= (3, 2) AND r1 <= 2;
 DROP TABLE pk_hash_range_int;
+
+-- Test index SPLIT AT with INCLUDE clause
+CREATE TABLE test_tbl (
+  a INT,
+  b INT,
+  PRIMARY KEY (a ASC)
+) SPLIT AT VALUES((1));
+CREATE INDEX test_idx on test_tbl(
+  b ASC
+) INCLUDE (a) SPLIT AT VALUES ((1));
+INSERT INTO test_tbl VALUES (1, 2),(2, 1),(4, 3),(5, 4);
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT a, b FROM test_tbl WHERE a = 4;
+SELECT a, b FROM test_tbl WHERE a = 4;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT a, b FROM test_tbl WHERE b = 4;
+SELECT a, b FROM test_tbl WHERE b = 4;
+DROP INDEX test_idx;
+DROP TABLE test_tbl;
+
+-- (#21004) The tests in this section validate that computation of range bounds
+-- is skipped while prechecking an Index-only Scan's rescan condition.
+DROP TABLE IF EXISTS aa;
+DROP TABLE IF EXISTS bb;
+CREATE TABLE aa (col_varchar_key VARCHAR(1), col_varchar_nokey VARCHAR(1));
+CREATE TABLE bb (col_varchar_key VARCHAR(1), col_varchar_nokey VARCHAR(1));
+INSERT INTO aa VALUES ('g', 'g');
+INSERT INTO bb VALUES ('g', 'g');
+CREATE INDEX bb_varchar_key ON bb (col_varchar_key ASC);
+-- Correlation between two different tables
+EXPLAIN (COSTS OFF) SELECT (
+  SELECT
+    COUNT(*)
+  FROM
+    bb AS subquery_t1
+  WHERE
+    subquery_t1.col_varchar_key <= table2.col_varchar_nokey AND
+    subquery_t1.col_varchar_key <= table2.col_varchar_nokey
+) AS field1
+FROM
+  aa AS table2;
+-- Correlation of the same table
+SELECT (
+  SELECT
+    COUNT(*)
+  FROM
+    bb AS subquery_t1
+  WHERE
+    subquery_t1.col_varchar_key >= table1.col_varchar_nokey AND
+    subquery_t1.col_varchar_key > 'a'
+) AS field1
+FROM
+  bb AS table1;
+
+create table sample(a int, b int, primary key(a asc, b asc));
+insert into sample values (1,1);
+insert into sample values (1,2);
+insert into sample values (2,1);
+
+explain (costs off) select * from sample where b < 2 and b >= 2;
+select * from sample where b < 2 and b >= 2;
+
+explain (costs off) select * from sample where b >= 2 and b < 2;
+select * from sample where b >= 2 and b < 2;
+
+explain (costs off) select * from sample where b < 2 and b >= 2;
+select * from sample where b < 2 and b >= 2;
+
+explain (costs off) select * from sample where b <= 2 and b < 2 and b >= 2;
+select * from sample where b <= 2 and b < 2 and b >= 2;
+
+explain (costs off) select * from sample where b <= 2 and b >= 2;
+select * from sample where b <= 2 and b >= 2;
+
+explain (costs off) select * from sample where b <= 3 and b <= 2 and b >= 2;
+select * from sample where b <= 3 and b <= 2 and b >= 2;
+
+drop table sample;
+
+-- GHI 21451 HASH Index on multiple expressions
+drop table IF EXISTS t1;
+create table t1 (c1 bigint, c2 jsonb, primary key ((c1)));
+insert into t1 (c1,c2) values (1,'{"c3":1,"c4":1}');
+insert into t1 (c1,c2) values (2,'{"c3":2,"c4":2}');
+create index t1_idx on t1 (((c2->>'c3'), (c2->>'c4')) hash);
+
+select * from t1;
+/*+IndexScan(t1 t1_idx)*/ explain (costs off) select * from t1 where (c2->>'c3') = '4';
+/*+IndexScan(t1 t1_idx)*/ select * from t1 where (c2->>'c3') = '4';
+/*+IndexScan(t1 t1_idx)*/ explain (costs off) select * from t1 where (c2->>'c4') = '4';
+/*+IndexScan(t1 t1_idx)*/ select * from t1 where (c2->>'c4') = '4';
+/*+IndexScan(t1 t1_idx)*/ explain (costs off) select * from t1 where (c2->>'c3') = '4' and (c2->>'c4') = '4';
+/*+IndexScan(t1 t1_idx)*/ select * from t1 where (c2->>'c3') = '4' and (c2->>'c4') = '4';
+
+drop table t1;
+
+create table sample(a int, primary key(a asc));
+insert into sample values (0);
+select * from sample where a = x'8000000000000000'::bigint;
+drop table sample;
+
+create table sample(a int2, primary key(a asc));
+insert into sample values (0);
+select * from sample where a = x'8000000000000000'::bigint;
+select * from sample where a = x'80000000'::int;
+drop table sample;

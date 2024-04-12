@@ -371,7 +371,7 @@ ExecRenameStmt(RenameStmt *stmt)
 		case OBJECT_DOMAIN:
 		case OBJECT_TYPE:
 			return RenameType(stmt);
-		
+
 		case OBJECT_FUNCTION:
 			return RenameFunction(stmt, stmt->newname);
 
@@ -437,6 +437,17 @@ ExecAlterObjectDependsStmt(AlterObjectDependsStmt *stmt, ObjectAddress *refAddre
 	address =
 		get_object_address_rv(stmt->objectType, stmt->relation, (List *) stmt->object,
 							  &rel, AccessExclusiveLock, false);
+
+	/*
+	 * Verify that the user is entitled to run the command.
+	 *
+	 * We don't check any privileges on the extension, because that's not
+	 * needed.  The object owner is stipulating, by running this command, that
+	 * the extension owner can drop the object whenever they feel like it,
+	 * which is not considered a problem.
+	 */
+	check_object_ownership(GetUserId(),
+						   stmt->objectType, address, stmt->object, rel);
 
 	/*
 	 * If a relation was involved, it would have been opened and locked. We
@@ -638,6 +649,8 @@ AlterObjectNamespace_oid(Oid classId, Oid objid, Oid nspOid,
 		case OCLASS_PUBLICATION_REL:
 		case OCLASS_SUBSCRIPTION:
 		case OCLASS_TRANSFORM:
+		case OCLASS_YBPROFILE:
+		case OCLASS_YBROLE_PROFILE:
 			/* ignore object types that don't have schema-qualified names */
 			break;
 
@@ -846,7 +859,7 @@ ExecAlterOwnerStmt(AlterOwnerStmt *stmt)
 		case OBJECT_YBTABLEGROUP:
 			return AlterTablegroupOwner(strVal((Value *) stmt->object),
 										newowner);
-		
+
 		case OBJECT_FUNCTION:
 			return AlterFunctionOwner(stmt,  newowner);
 

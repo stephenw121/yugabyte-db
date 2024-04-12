@@ -2901,7 +2901,7 @@ expression_tree_mutator(Node *node,
 
 				FLATCOPY(newnode, bexpr, YbBatchedExpr);
 				MUTATE(newnode->orig_expr, bexpr->orig_expr, Expr *);
-				return (Node *) newnode;			
+				return (Node *) newnode;
 			}
 		case T_WithCheckOption:
 			{
@@ -3213,7 +3213,7 @@ expression_tree_mutator(Node *node,
 
 				FLATCOPY(newnode, rcexpr, RowCompareExpr);
 				MUTATE(newnode->largs, rcexpr->largs, List *);
-				MUTATE(newnode->rargs, rcexpr->rargs, List *);
+				MUTATE(newnode->rargs, rcexpr->rargs, Node *);
 				return (Node *) newnode;
 			}
 			break;
@@ -3491,6 +3491,16 @@ expression_tree_mutator(Node *node,
 				MUTATE(newnode->rowexpr, tf->rowexpr, Node *);
 				MUTATE(newnode->colexprs, tf->colexprs, List *);
 				MUTATE(newnode->coldefexprs, tf->coldefexprs, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_RestrictInfo:
+			{
+				RestrictInfo   *rinfo = (RestrictInfo *) node;
+				RestrictInfo   *newnode;
+
+				FLATCOPY(newnode, rinfo, RestrictInfo);
+				MUTATE(newnode->clause, rinfo->clause, Expr *);
 				return (Node *) newnode;
 			}
 			break;
@@ -4274,4 +4284,26 @@ planstate_walk_members(PlanState **planstates, int nplans,
 	}
 
 	return false;
+}
+
+/*
+ * Given PlanState, return pointer to aggrefs field if it exists, NULL
+ * otherwise.
+ */
+List **
+YbPlanStateTryGetAggrefs(PlanState *ps)
+{
+	switch (nodeTag(ps))
+	{
+		case T_ForeignScanState:
+			return &castNode(ForeignScanState, ps)->yb_fdw_aggrefs;
+		case T_IndexOnlyScanState:
+			return &castNode(IndexOnlyScanState, ps)->yb_ioss_aggrefs;
+		case T_IndexScanState:
+			return &castNode(IndexScanState, ps)->yb_iss_aggrefs;
+		case T_YbSeqScanState:
+			return &castNode(YbSeqScanState, ps)->aggrefs;
+		default:
+			return NULL;
+	}
 }

@@ -8,12 +8,15 @@ import static play.libs.Json.toJson;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.google.common.collect.ImmutableSet;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import com.yugabyte.yw.common.config.RuntimeConfigFactory;
 import com.yugabyte.yw.forms.DatabaseSecurityFormData;
+import com.yugabyte.yw.forms.DatabaseUserDropFormData;
 import com.yugabyte.yw.forms.DatabaseUserFormData;
 import com.yugabyte.yw.forms.RunQueryFormData;
+import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.CommonUtils;
 import com.yugabyte.yw.models.helpers.NodeDetails;
@@ -35,10 +38,27 @@ import play.mvc.Http;
 @Singleton
 public class YsqlQueryExecutor {
   private static final Logger LOG = LoggerFactory.getLogger(YsqlQueryExecutor.class);
-  private static final String DEFAULT_DB_USER = Util.DEFAULT_YSQL_USERNAME;
-  private static final String DEFAULT_DB_PASSWORD = Util.DEFAULT_YSQL_PASSWORD;
   private static final String DB_ADMIN_ROLE_NAME = Util.DEFAULT_YSQL_ADMIN_ROLE_NAME;
   private static final String PRECREATED_DB_ADMIN = "yb_db_admin";
+
+  // This is the list of users that are created by default by the database.
+  // Therefore, we don't want to allow YBA to delete them.
+  private static final ImmutableSet<String> NON_DELETABLE_USERS =
+      ImmutableSet.of(
+          "postgres",
+          "pg_monitor",
+          "pg_read_all_settings",
+          "pg_read_all_stats",
+          "pg_stat_scan_tables",
+          "pg_signal_backend",
+          "pg_read_server_files",
+          "pg_write_server_files",
+          "pg_execute_server_program",
+          "yb_extension",
+          "yb_fdw",
+          "yb_db_admin",
+          "yugabyte",
+          "yb_superuser");
 
   private static final String DEL_PG_ROLES_CMD_1 =
       "SET YB_NON_DDL_TXN_FOR_SYS_TABLES_ALLOWED=ON; "
@@ -48,11 +68,8 @@ public class YsqlQueryExecutor {
           + "('pg_execute_server_program', 'pg_read_server_files', "
           + "'pg_write_server_files'));";
   private static final String DEL_PG_ROLES_CMD_2 =
-      "SET YB_NON_DDL_TXN_FOR_SYS_TABLES_ALLOWED=ON; "
-          + "DROP ROLE IF EXISTS pg_execute_server_program, pg_read_server_files, "
-          + "pg_write_server_files; "
-          + "UPDATE pg_yb_catalog_version "
-          + "SET current_version = current_version + 1 WHERE db_oid = 1;";
+      "DROP ROLE IF EXISTS pg_execute_server_program, pg_read_server_files, "
+          + "pg_write_server_files; ";
 
   RuntimeConfigFactory runtimeConfigFactory;
   NodeUniverseManager nodeUniverseManager;
@@ -69,6 +86,16 @@ public class YsqlQueryExecutor {
   }
 
   private String getQueryType(String queryString) {
+    // Ignore Set statements. E.g.: /*+Set(yb_bnl_batch_size 20)*/SELECT a.rolname, t.datname, ...
+    if (queryString.startsWith("/*")) {
+      String[] queryStringParts = queryString.split("\\*/", 2);
+      if (queryStringParts.length < 2) {
+        LOG.warn("Illegal YSQL query string: {}", queryString);
+      } else {
+        queryString = queryStringParts[1].trim();
+      }
+    }
+
     String[] queryParts = queryString.split(" ");
     String command = queryParts[0].toUpperCase();
     if (command.equals("TRUNCATE") || command.equals("DROP"))
@@ -104,18 +131,14 @@ public class YsqlQueryExecutor {
     return rows;
   }
 
-  public JsonNode executeQuery(Universe universe, RunQueryFormData queryParams) {
-    return executeQuery(universe, queryParams, DEFAULT_DB_USER, DEFAULT_DB_PASSWORD);
-  }
-
   public JsonNode executeQuery(
       Universe universe, RunQueryFormData queryParams, String username, String password) {
     ObjectNode response = newObject();
 
-    // TODO: implement execute query for CQL
     String ysqlEndpoints = universe.getYSQLServerAddresses();
     String connectString =
-        String.format("jdbc:postgresql://%s/%s", ysqlEndpoints.split(",")[0], queryParams.db_name);
+        String.format(
+            "jdbc:postgresql://%s/%s", ysqlEndpoints.split(",")[0], queryParams.getDbName());
     Properties props = new Properties();
     props.put("user", username);
     props.put("password", password);
@@ -131,7 +154,7 @@ public class YsqlQueryExecutor {
       if (conn == null) {
         response.put("error", "Unable to connect to DB");
       } else {
-        PreparedStatement p = conn.prepareStatement(queryParams.query);
+        PreparedStatement p = conn.prepareStatement(queryParams.getQuery());
         boolean hasResult = p.execute();
         if (hasResult) {
           ResultSet result = p.getResultSet();
@@ -139,29 +162,63 @@ public class YsqlQueryExecutor {
           response.set("result", toJson(rows));
         } else {
           response
-              .put("queryType", getQueryType(queryParams.query))
+              .put("queryType", getQueryType(queryParams.getQuery()))
               .put("count", p.getUpdateCount());
         }
       }
     } catch (SQLException | RuntimeException e) {
-      response.put("error", removeQueryFromErrorMessage(e.getMessage(), queryParams.query));
+      response.put("error", removeQueryFromErrorMessage(e.getMessage(), queryParams.getQuery()));
     }
     return response;
   }
 
   public JsonNode executeQueryInNodeShell(
       Universe universe, RunQueryFormData queryParams, NodeDetails node) {
+    return executeQueryInNodeShell(
+        universe,
+        queryParams,
+        node,
+        runtimeConfigFactory.forUniverse(universe).getLong("yb.ysql_timeout_secs"));
+  }
+
+  public JsonNode executeQueryInNodeShell(
+      Universe universe, RunQueryFormData queryParams, NodeDetails node, boolean authEnabled) {
+    return executeQueryInNodeShell(
+        universe,
+        queryParams,
+        node,
+        runtimeConfigFactory.forUniverse(universe).getLong("yb.ysql_timeout_secs"),
+        authEnabled);
+  }
+
+  public JsonNode executeQueryInNodeShell(
+      Universe universe, RunQueryFormData queryParams, NodeDetails node, long timeoutSec) {
+
+    return executeQueryInNodeShell(
+        universe,
+        queryParams,
+        node,
+        timeoutSec,
+        universe.getUniverseDetails().getPrimaryCluster().userIntent.isYSQLAuthEnabled());
+  }
+
+  public JsonNode executeQueryInNodeShell(
+      Universe universe,
+      RunQueryFormData queryParams,
+      NodeDetails node,
+      long timeoutSec,
+      boolean authEnabled) {
     ObjectNode response = newObject();
     response.put("type", "ysql");
-    String queryType = getQueryType(queryParams.query);
+    String queryType = getQueryType(queryParams.getQuery());
     String queryString =
-        queryType.equals("SELECT") ? wrapJsonAgg(queryParams.query) : queryParams.query;
-
+        queryType.equals("SELECT") ? wrapJsonAgg(queryParams.getQuery()) : queryParams.getQuery();
     ShellResponse shellResponse = new ShellResponse();
     try {
       shellResponse =
           nodeUniverseManager
-              .runYsqlCommand(node, universe, queryParams.db_name, queryString)
+              .runYsqlCommand(
+                  node, universe, queryParams.getDbName(), queryString, timeoutSec, authEnabled)
               .processErrors("Ysql Query Execution Error");
     } catch (RuntimeException e) {
       response.put("error", ShellResponse.cleanedUpErrorMessage(e.getMessage()));
@@ -185,25 +242,97 @@ public class YsqlQueryExecutor {
     return response;
   }
 
-  public JsonNode runQueryUtil(Universe universe, DatabaseUserFormData data, String query) {
-    RunQueryFormData ysqlQuery = new RunQueryFormData();
-    // Create user for customer YSQL.
-    ysqlQuery.query = query;
-    ysqlQuery.db_name = data.dbName;
-    JsonNode ysqlResponse =
-        executeQuery(universe, ysqlQuery, data.ysqlAdminUsername, data.ysqlAdminPassword);
-    if (ysqlResponse.has("error")) {
-      String errorMsg = ysqlResponse.get("error").asText();
-      LOG.error("Error executing query: {}", errorMsg);
-      throw new PlatformServiceException(Http.Status.BAD_REQUEST, errorMsg);
+  public void dropUser(Universe universe, DatabaseUserDropFormData data) {
+    Customer customer = Customer.get(universe.getCustomerId());
+    boolean isCloudEnabled =
+        runtimeConfigFactory.forCustomer(customer).getBoolean("yb.cloud.enabled");
+
+    if (!isCloudEnabled) {
+      throw new PlatformServiceException(Http.Status.METHOD_NOT_ALLOWED, "Feature not allowed.");
     }
-    return ysqlResponse;
+
+    // trim the username to make sure it does not contain spaces
+    data.username = data.username.trim();
+
+    LOG.info("Removing user='{}' for universe='{}'", data.username, universe.getName());
+    if (NON_DELETABLE_USERS.contains(data.username)) {
+      throw new PlatformServiceException(
+          Http.Status.BAD_REQUEST,
+          "Cannot delete user: " + data.username + ". This is a system user.");
+    }
+
+    String query = String.format("DROP USER \"%s\"; ", data.username);
+
+    try {
+      runUserDbCommands(query, data.dbName, universe);
+      LOG.info("Dropped user '{}' for universe '{}'", data.username, universe.getName());
+    } catch (PlatformServiceException e) {
+      if (e.getHttpStatus() == Http.Status.BAD_REQUEST
+          && e.getMessage().contains("does not exist")) {
+        LOG.warn("User '{}' does not exist for universe '{}'", data.username, universe.getName());
+      } else {
+        LOG.error(
+            "Error dropping user '{}' for universe '{}'", data.username, universe.getName(), e);
+        throw e;
+      }
+    }
+  }
+
+  public void createRestrictedUser(Universe universe, DatabaseUserFormData data) {
+    Customer customer = Customer.get(universe.getCustomerId());
+    boolean isCloudEnabled =
+        runtimeConfigFactory.forCustomer(customer).getBoolean("yb.cloud.enabled");
+
+    if (!isCloudEnabled) {
+      throw new PlatformServiceException(Http.Status.METHOD_NOT_ALLOWED, "Feature not allowed.");
+    }
+
+    // trim the username to make sure it does not contain spaces
+    data.username = data.username.trim();
+
+    LOG.info("Creating restricted user='{}' for universe='{}'", data.username, universe.getName());
+
+    StringBuilder createUserWithPrivileges = new StringBuilder();
+
+    createUserWithPrivileges
+        .append(
+            String.format(
+                "CREATE USER \"%s\" PASSWORD '%s'; ",
+                data.username, Util.escapeSingleQuotesOnly(data.password)))
+        .append(
+            String.format(
+                "GRANT EXECUTE ON FUNCTION pg_stat_statements_reset TO \"%1$s\"; ", data.username))
+        .append(DEL_PG_ROLES_CMD_1);
+
+    try {
+      runUserDbCommands(createUserWithPrivileges.toString(), data.dbName, universe);
+      LOG.info("Created restricted user and deleted dependencies");
+    } catch (PlatformServiceException e) {
+      if (e.getHttpStatus() == Http.Status.BAD_REQUEST
+          && e.getMessage().contains("already exists")) {
+        // User exists, we should still try and run the rest of the tasks
+        // since they are idempotent.
+        LOG.warn(String.format("Restricted user already exists, skipping...\n%s", e.getMessage()));
+      } else {
+        throw e;
+      }
+    }
+
+    StringBuilder resetPgStatStatements = new StringBuilder();
+    resetPgStatStatements.append(DEL_PG_ROLES_CMD_2).append(" SELECT pg_stat_statements_reset(); ");
+    runUserDbCommands(resetPgStatStatements.toString(), data.dbName, universe);
+    LOG.info(
+        "Dropped unrequired roles and assigned permissions to the restricted user='{}' for"
+            + " universe='{}'",
+        data.username,
+        universe.getName());
   }
 
   public void createUser(Universe universe, DatabaseUserFormData data) {
 
+    Customer customer = Customer.get(universe.getCustomerId());
     boolean isCloudEnabled =
-        runtimeConfigFactory.forUniverse(universe).getBoolean("yb.cloud.enabled");
+        runtimeConfigFactory.forCustomer(customer).getBoolean("yb.cloud.enabled");
 
     StringBuilder allQueries = new StringBuilder();
     String query;
@@ -227,6 +356,12 @@ public class YsqlQueryExecutor {
         // yb_extension is only supported in recent YB versions 2.6.x >= 2.6.4 and >= 2.8.0
         // not including the odd 2.7.x, 2.9.x releases
         rolesList += ", yb_extension";
+      }
+      boolean isYbFdwSupported =
+          universe.getVersions().stream().allMatch(v -> Util.compareYbVersions(v, "2.8.1.0") >= 0);
+      if (isYbFdwSupported) {
+        // yb_fdw is only supported in recent YB versions >= 2.8.1
+        rolesList += ", yb_fdw";
       }
       query =
           String.format(
@@ -258,9 +393,7 @@ public class YsqlQueryExecutor {
       allQueries.setLength(0);
 
       versionMatch =
-          universe
-              .getVersions()
-              .stream()
+          universe.getVersions().stream()
               .allMatch(v -> Util.compareYbVersions(v, "2.12.2.0-b31") >= 0);
       if (versionMatch) {
         query =
@@ -281,7 +414,7 @@ public class YsqlQueryExecutor {
     LOG.info("Assigned permissions to the user");
   }
 
-  private void runUserDbCommands(String query, String dbName, Universe universe) {
+  public JsonNode runUserDbCommands(String query, String dbName, Universe universe) {
     NodeDetails nodeToUse;
     try {
       nodeToUse = CommonUtils.getServerToRunYsqlQuery(universe);
@@ -290,19 +423,22 @@ public class YsqlQueryExecutor {
           Http.Status.INTERNAL_SERVER_ERROR, "DB not ready to create a user");
     }
     RunQueryFormData ysqlQuery = new RunQueryFormData();
-    ysqlQuery.query = query;
-    ysqlQuery.db_name = dbName;
+    ysqlQuery.setQuery(query);
+    ysqlQuery.setDbName(dbName);
+
     JsonNode ysqlResponse = executeQueryInNodeShell(universe, ysqlQuery, nodeToUse);
     if (ysqlResponse.has("error")) {
       throw new PlatformServiceException(
           Http.Status.BAD_REQUEST, ysqlResponse.get("error").asText());
     }
+
+    return ysqlResponse;
   }
 
   public void validateAdminPassword(Universe universe, DatabaseSecurityFormData data) {
     RunQueryFormData ysqlQuery = new RunQueryFormData();
-    ysqlQuery.db_name = data.dbName;
-    ysqlQuery.query = "SELECT 1";
+    ysqlQuery.setDbName(data.dbName);
+    ysqlQuery.setQuery("SELECT 1");
     JsonNode ysqlResponse =
         executeQuery(universe, ysqlQuery, data.ysqlAdminUsername, data.ysqlAdminPassword);
     if (ysqlResponse.has("error")) {

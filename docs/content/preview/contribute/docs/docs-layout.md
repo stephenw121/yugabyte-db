@@ -3,7 +3,6 @@ title: Find the right page or section
 headerTitle: Find the right page or section
 linkTitle: Docs layout
 description: Find the right location in the YugabyteDB docs
-image: /images/section_icons/index/quick_start.png
 menu:
   preview:
     identifier: docs-layout
@@ -43,6 +42,12 @@ Here are some examples of reference docs in our documentation:
 ### Design docs on GitHub
 
 We also have design docs [in GitHub](https://github.com/yugabyte/yugabyte-db/tree/master/architecture/design). These design docs should be referenced from the Reference section in the docs.
+
+## Legend for illustrations
+
+Many of the illustrations in the docs use the following legend to represent tablet leaders and followers, cloud regions and zones, and applications.
+
+![Legend for illustrations](/images/develop/global-apps/global-database-legend.png)
 
 ## Next steps
 

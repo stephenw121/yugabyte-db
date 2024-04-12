@@ -16,27 +16,24 @@
  * under the License.
  *
  * src/backend/access/yb_access/yb_lsm.c
- *
- * TODO: currently this file contains skeleton index access methods. They will be implemented in
- * coming revisions.
  *--------------------------------------------------------------------------------------------------
  */
 
 #include "postgres.h"
-#include "pgstat.h"
 
-#include "miscadmin.h"
 #include "access/nbtree.h"
 #include "access/reloptions.h"
 #include "access/relscan.h"
 #include "access/sysattr.h"
 #include "access/yb_scan.h"
-#include "access/yb_lsm.h"
 #include "catalog/index.h"
 #include "catalog/pg_type.h"
-#include "commands/ybccmds.h"
-#include "utils/rel.h"
 #include "executor/ybcModifyTable.h"
+#include "miscadmin.h"
+#include "pgstat.h"
+#include "utils/rel.h"
+
+static void ybcinendscan(IndexScanDesc scan);
 
 /* --------------------------------------------------------------------------------------------- */
 
@@ -52,59 +49,6 @@ typedef struct
 	 */
 	const uint64_t *backfill_write_time;
 } YBCBuildState;
-
-/*
- * LSM handler function: return IndexAmRoutine with access method parameters
- * and callbacks.
- */
-Datum
-ybcinhandler(PG_FUNCTION_ARGS)
-{
-	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
-
-	amroutine->amstrategies = BTMaxStrategyNumber;
-	amroutine->amsupport = BTNProcs;
-	amroutine->amcanorder = true;
-	amroutine->amcanorderbyop = false;
-	amroutine->amcanbackward = true;
-	amroutine->amcanunique = true;
-	amroutine->amcanmulticol = true;
-	amroutine->amoptionalkey = true;
-	amroutine->amsearcharray = true;
-	amroutine->amsearchnulls = true;
-	amroutine->amstorage = false;
-	amroutine->amclusterable = true;
-	amroutine->ampredlocks = true;
-	amroutine->amcanparallel = false; /* TODO: support parallel scan */
-	amroutine->amcaninclude = true;
-	amroutine->amkeytype = InvalidOid;
-
-	amroutine->ambuild = ybcinbuild;
-	amroutine->ambuildempty = ybcinbuildempty;
-	amroutine->aminsert = NULL; /* use yb_aminsert below instead */
-	amroutine->ambulkdelete = ybcinbulkdelete;
-	amroutine->amvacuumcleanup = ybcinvacuumcleanup;
-	amroutine->amcanreturn = ybcincanreturn;
-	amroutine->amcostestimate = ybcincostestimate;
-	amroutine->amoptions = ybcinoptions;
-	amroutine->amproperty = ybcinproperty;
-	amroutine->amvalidate = ybcinvalidate;
-	amroutine->ambeginscan = ybcinbeginscan;
-	amroutine->amrescan = ybcinrescan;
-	amroutine->amgettuple = ybcingettuple;
-	amroutine->amgetbitmap = NULL; /* TODO: support bitmap scan */
-	amroutine->amendscan = ybcinendscan;
-	amroutine->ammarkpos = NULL; /* TODO: support mark/restore pos with ordering */
-	amroutine->amrestrpos = NULL;
-	amroutine->amestimateparallelscan = NULL; /* TODO: support parallel scan */
-	amroutine->aminitparallelscan = NULL;
-	amroutine->amparallelrescan = NULL;
-	amroutine->yb_aminsert = ybcininsert;
-	amroutine->yb_amdelete = ybcindelete;
-	amroutine->yb_ambackfill = ybcinbackfill;
-
-	PG_RETURN_POINTER(amroutine);
-}
 
 /*
  * Utility method to bind const to column.
@@ -211,7 +155,7 @@ ybcinbuildCallback(Relation index, HeapTuple heapTuple, Datum *values, bool *isn
 	buildstate->index_tuples += 1;
 }
 
-IndexBuildResult *
+static IndexBuildResult *
 ybcinbuild(Relation heap, Relation index, struct IndexInfo *indexInfo)
 {
 	YBCBuildState	buildstate;
@@ -239,7 +183,7 @@ ybcinbuild(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	return result;
 }
 
-IndexBuildResult *
+static IndexBuildResult *
 ybcinbackfill(Relation heap,
 			  Relation index,
 			  struct IndexInfo *indexInfo,
@@ -271,13 +215,13 @@ ybcinbackfill(Relation heap,
 	return result;
 }
 
-void
+static void
 ybcinbuildempty(Relation index)
 {
 	YBC_LOG_WARNING("Unexpected building of empty unlogged index");
 }
 
-bool
+static bool
 ybcininsert(Relation index, Datum *values, bool *isnull, Datum ybctid, Relation heap,
 			IndexUniqueCheck checkUnique, struct IndexInfo *indexInfo, bool sharedInsert)
 {
@@ -319,7 +263,7 @@ ybcininsert(Relation index, Datum *values, bool *isnull, Datum ybctid, Relation 
 	return index->rd_index->indisunique ? true : false;
 }
 
-void
+static void
 ybcindelete(Relation index, Datum *values, bool *isnull, Datum ybctid, Relation heap,
 			struct IndexInfo *indexInfo)
 {
@@ -328,7 +272,7 @@ ybcindelete(Relation index, Datum *values, bool *isnull, Datum ybctid, Relation 
 							  doBindsForIdxWrite, NULL /* indexstate */);
 }
 
-IndexBulkDeleteResult *
+static IndexBulkDeleteResult *
 ybcinbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 				IndexBulkDeleteCallback callback, void *callback_state)
 {
@@ -336,16 +280,29 @@ ybcinbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	return NULL;
 }
 
-IndexBulkDeleteResult *
+/*
+ * Post-VACUUM cleanup.
+ *
+ * Result: a palloc'd struct containing statistical info for VACUUM displays.
+ *
+ * YB: this function is based on btvacuumcleanup implementation.
+ * We only support ANALYZE and don't support VACUUM as of 04/05/2024.
+ */
+static IndexBulkDeleteResult *
 ybcinvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
+	/* No-op in ANALYZE ONLY mode */
+	if (info->analyze_only)
+		return stats;
+
 	YBC_LOG_WARNING("Unexpected index cleanup via vacuum");
 	return NULL;
 }
 
 /* --------------------------------------------------------------------------------------------- */
 
-bool ybcincanreturn(Relation index, int attno)
+static bool
+ybcincanreturn(Relation index, int attno)
 {
 	/*
 	 * If "canreturn" is true, Postgres will attempt to perform index-only scan on the indexed
@@ -358,7 +315,54 @@ bool ybcincanreturn(Relation index, int attno)
 	return !index->rd_index->indisprimary;
 }
 
-void
+static bool
+ybcinmightrecheck(Relation heap, Relation index, bool xs_want_itup,
+				  ScanKey keys, int nkeys)
+{
+	return YbPredetermineNeedsRecheck(heap, index, xs_want_itup, keys, nkeys);
+}
+
+static int64
+ybcgetbitmap(IndexScanDesc scan, YbTIDBitmap *ybtbm)
+{
+	size_t		new_tuples = 0;
+	SliceVector ybctids;
+	YbScanDesc	ybscan = (YbScanDesc) scan->opaque;
+	bool 		exceeded_work_mem = false;
+
+	ybscan->exec_params = scan->yb_exec_params;
+	/* exec_params can be NULL in case of systable_getnext, for example. */
+	if (ybscan->exec_params)
+		ybscan->exec_params->work_mem = work_mem;
+
+	if (!ybscan->is_exec_done)
+		pgstat_count_index_scan(scan->indexRelation);
+
+	/* Special case: aggregate pushdown. */
+	if (scan->yb_aggrefs)
+		elog(ERROR, "TODO: Handle aggregate pushdown");
+
+	if (ybscan->quit_scan || ybtbm->work_mem_exceeded)
+		return 0;
+
+	ybtbm->recheck |= YbPredetermineNeedsRecheck(ybscan->relation, ybscan->index,
+												 true /* xs_want_itup */,
+												 *ybscan->keys, ybscan->nkeys);
+
+	HandleYBStatus(YBCPgRetrieveYbctids(ybscan->handle, ybscan->exec_params,
+										ybscan->target_desc->natts, &ybctids, &new_tuples,
+										&exceeded_work_mem));
+	if (!exceeded_work_mem)
+		yb_tbm_add_tuples(ybtbm, ybctids);
+	else
+		yb_tbm_set_work_mem_exceeded(ybtbm);
+
+	YBCBitmapShallowDeleteVector(ybctids);
+
+	return ybtbm->work_mem_exceeded ? 0 : new_tuples;
+}
+
+static void
 ybcincostestimate(struct PlannerInfo *root, struct IndexPath *path, double loop_count,
 				  Cost *indexStartupCost, Cost *indexTotalCost, Selectivity *indexSelectivity,
 				  double *indexCorrelation, double *indexPages)
@@ -377,20 +381,20 @@ ybcincostestimate(struct PlannerInfo *root, struct IndexPath *path, double loop_
 						 indexTotalCost);
 }
 
-bytea *
+static bytea *
 ybcinoptions(Datum reloptions, bool validate)
 {
 	return default_reloptions(reloptions, validate, RELOPT_KIND_YB_LSM);
 }
 
-bool
+static bool
 ybcinproperty(Oid index_oid, int attno, IndexAMProperty prop, const char *propname,
 			  bool *res, bool *isnull)
 {
 	return false;
 }
 
-bool
+static bool
 ybcinvalidate(Oid opclassoid)
 {
 	return true;
@@ -398,7 +402,7 @@ ybcinvalidate(Oid opclassoid)
 
 /* --------------------------------------------------------------------------------------------- */
 
-IndexScanDesc
+static IndexScanDesc
 ybcinbeginscan(Relation rel, int nkeys, int norderbys)
 {
 	IndexScanDesc scan;
@@ -409,16 +413,19 @@ ybcinbeginscan(Relation rel, int nkeys, int norderbys)
 	/* get the scan */
 	scan = RelationGetIndexScan(rel, nkeys, norderbys);
 	scan->opaque = NULL;
-	pgstat_count_index_scan(rel);
+
 	return scan;
 }
 
-void
+static void
 ybcinrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,	ScanKey orderbys, int norderbys)
 {
 	if (scan->opaque)
 	{
+		YbScanDesc ybScan = (YbScanDesc) scan->opaque;
 		/* For rescan, end the previous scan. */
+		if (ybScan->pscan)
+			yb_init_partition_key_data(ybScan->pscan);
 		ybcinendscan(scan);
 		scan->opaque = NULL;
 	}
@@ -426,8 +433,36 @@ ybcinrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,	ScanKey orderbys
 	YbScanDesc ybScan = ybcBeginScan(scan->heapRelation, scan->indexRelation,
 									 scan->xs_want_itup, nscankeys, scankey,
 									 scan->yb_scan_plan, scan->yb_rel_pushdown,
-									 scan->yb_idx_pushdown);
+									 scan->yb_idx_pushdown, scan->yb_aggrefs,
+									 scan->yb_distinct_prefixlen,
+									 scan->yb_exec_params,
+									 false /* is_internal_scan */,
+									 scan->fetch_ybctids_only);
 	scan->opaque = ybScan;
+	if (scan->parallel_scan)
+	{
+		ParallelIndexScanDesc target = scan->parallel_scan;
+		ScanDirection direction = ForwardScanDirection;
+		ybScan->pscan = (YBParallelPartitionKeys)
+			OffsetToPointer(target, target->ps_offset);
+		Relation rel = scan->indexRelation;
+		/* If scan is by the PK, use the main relation instead */
+		if (scan->heapRelation &&
+			scan->heapRelation->rd_pkindex == RelationGetRelid(rel))
+		{
+			elog(LOG, "Scan is by PK, get parallel ranges from the main table");
+			rel = scan->heapRelation;
+		}
+		if (scan->yb_scan_plan)
+		{
+			if IsA(scan->yb_scan_plan, IndexScan)
+				direction = ((IndexScan *) scan->yb_scan_plan)->indexorderdir;
+			else if IsA(scan->yb_scan_plan, IndexOnlyScan)
+				direction = ((IndexOnlyScan *) scan->yb_scan_plan)->indexorderdir;
+		}
+		ybParallelPrepare(ybScan->pscan, rel, scan->yb_exec_params,
+						  !ScanDirectionIsBackward(direction));
+	}
 }
 
 /*
@@ -439,52 +474,186 @@ ybcinrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,	ScanKey orderbys
  *   - Query ROWID from IndexTable using key.
  *   - Query data from Table (relation) using ROWID.
  */
-bool
+static bool
 ybcingettuple(IndexScanDesc scan, ScanDirection dir)
 {
-	Assert(dir == ForwardScanDirection || dir == BackwardScanDirection);
-	const bool is_forward_scan = (dir == ForwardScanDirection);
-
 	YbScanDesc ybscan = (YbScanDesc) scan->opaque;
 	ybscan->exec_params = scan->yb_exec_params;
-	if (!ybscan->exec_params) {
-		ereport(DEBUG1, (errmsg("null exec_params")));
+	/* exec_params can be NULL in case of systable_getnext, for example. */
+	if (ybscan->exec_params)
+		ybscan->exec_params->work_mem = work_mem;
+
+	if (!ybscan->is_exec_done)
+		pgstat_count_index_scan(scan->indexRelation);
+
+	/* Special case: aggregate pushdown. */
+	if (scan->yb_aggrefs)
+	{
+		/*
+		 * TODO(jason): deduplicate with ybc_getnext_heaptuple,
+		 * ybc_getnext_indextuple.
+		 */
+		if (ybscan->quit_scan)
+			return false;
+
+		scan->xs_recheck = YbNeedsPgRecheck(ybscan);
+		/*
+		 * In the case of parallel scan we need to obtain boundaries from the
+		 * pscan before the scan is executed. Also empty row from parallel range
+		 * scan does not mean scan is done, it means the range is done and we
+		 * need to pick up next. No rows from parallel range is possible, hence
+		 * the loop.
+		 */
+		while (true)
+		{
+			/* Need to execute the request */
+			if (!ybscan->is_exec_done)
+			{
+				/* Parallel mode: pick up parallel block first */
+				if (ybscan->pscan != NULL)
+				{
+					YBParallelPartitionKeys parallel_scan = ybscan->pscan;
+					const char *low_bound;
+					size_t low_bound_size;
+					const char *high_bound;
+					size_t high_bound_size;
+					/*
+					 * If range is found, apply the boundaries, false means the
+					 * scan * is done for that worker.
+					 */
+					if (ybParallelNextRange(parallel_scan,
+											&low_bound, &low_bound_size,
+											&high_bound, &high_bound_size))
+					{
+						HandleYBStatus(YBCPgDmlBindRange(
+							ybscan->handle, low_bound, low_bound_size,
+							high_bound, high_bound_size));
+						if (low_bound)
+							pfree((void *) low_bound);
+						if (high_bound)
+							pfree((void *) high_bound);
+					}
+					else
+						return false;
+					/*
+					 * Use unlimited fetch.
+					 * Parallel scan range is already of limited size, it is
+					 * unlikely to exceed the
+					 * message size, but may save some RPCs.
+					 */
+					ybscan->exec_params->limit_use_default = true;
+					ybscan->exec_params->yb_fetch_row_limit = 0;
+					ybscan->exec_params->yb_fetch_size_limit = 0;
+				}
+				/* Request with aggregates does not care of scan direction */
+				HandleYBStatus(YBCPgExecSelect(ybscan->handle,
+											   ybscan->exec_params));
+				ybscan->is_exec_done = true;
+			}
+
+			/*
+			 * Aggregate pushdown directly modifies the scan slot rather than
+			 * passing it through xs_hitup or xs_itup.
+			 */
+			if (ybc_getnext_aggslot(scan, ybscan->handle,
+									ybscan->prepare_params.index_only_scan))
+				return true;
+			/*
+			 * Parallel scan needs to pick next range and reexecute, done
+			 * otherwise.
+			 */
+			if (ybscan->pscan)
+				ybscan->is_exec_done = false;
+			else
+				return false;
+		}
 	}
-	Assert(PointerIsValid(ybscan));
 
 	/*
 	 * IndexScan(SysTable, Index) --> HeapTuple.
 	 */
-	scan->xs_ctup.t_ybctid = 0;
+	bool has_tuple = false;
 	if (ybscan->prepare_params.index_only_scan)
 	{
-		IndexTuple tuple = ybc_getnext_indextuple(ybscan, is_forward_scan, &scan->xs_recheck);
+		IndexTuple tuple = ybc_getnext_indextuple(ybscan, dir, &scan->xs_recheck);
 		if (tuple)
 		{
-			scan->xs_ctup.t_ybctid = tuple->t_ybctid;
 			scan->xs_itup = tuple;
 			scan->xs_itupdesc = RelationGetDescr(scan->indexRelation);
+			has_tuple = true;
 		}
 	}
 	else
 	{
-		HeapTuple tuple = ybc_getnext_heaptuple(ybscan, is_forward_scan, &scan->xs_recheck);
+		HeapTuple tuple = ybc_getnext_heaptuple(ybscan, dir, &scan->xs_recheck);
 		if (tuple)
 		{
-			scan->xs_ctup.t_ybctid = tuple->t_ybctid;
 			scan->xs_hitup = tuple;
 			scan->xs_hitupdesc = RelationGetDescr(scan->heapRelation);
+			has_tuple = true;
 		}
 	}
 
-	return scan->xs_ctup.t_ybctid != 0;
+	return has_tuple;
 }
 
-void
+static void
 ybcinendscan(IndexScanDesc scan)
 {
-	YbScanDesc ybscan = (YbScanDesc)scan->opaque;
-	Assert(PointerIsValid(ybscan));
-	YBCPgDeleteStatement(ybscan->handle);
-	pfree(ybscan);
+	ybc_free_ybscan((YbScanDesc)scan->opaque);
+}
+
+/*
+ * LSM handler function: return IndexAmRoutine with access method parameters
+ * and callbacks.
+ */
+Datum
+ybcinhandler(PG_FUNCTION_ARGS)
+{
+	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
+
+	amroutine->amstrategies = BTMaxStrategyNumber;
+	amroutine->amsupport = BTNProcs;
+	amroutine->amcanorder = true;
+	amroutine->amcanorderbyop = false;
+	amroutine->amcanbackward = true;
+	amroutine->amcanunique = true;
+	amroutine->amcanmulticol = true;
+	amroutine->amoptionalkey = true;
+	amroutine->amsearcharray = true;
+	amroutine->amsearchnulls = true;
+	amroutine->amstorage = false;
+	amroutine->amclusterable = true;
+	amroutine->ampredlocks = true;
+	amroutine->amcanparallel = true;
+	amroutine->amcaninclude = true;
+	amroutine->amkeytype = InvalidOid;
+
+	amroutine->ambuild = ybcinbuild;
+	amroutine->ambuildempty = ybcinbuildempty;
+	amroutine->aminsert = NULL; /* use yb_aminsert below instead */
+	amroutine->ambulkdelete = ybcinbulkdelete;
+	amroutine->amvacuumcleanup = ybcinvacuumcleanup;
+	amroutine->amcanreturn = ybcincanreturn;
+	amroutine->amcostestimate = ybcincostestimate;
+	amroutine->amoptions = ybcinoptions;
+	amroutine->amproperty = ybcinproperty;
+	amroutine->amvalidate = ybcinvalidate;
+	amroutine->ambeginscan = ybcinbeginscan;
+	amroutine->amrescan = ybcinrescan;
+	amroutine->amgettuple = ybcingettuple;
+	amroutine->amgetbitmap = NULL; /* use yb_amgetbitmap below instead */
+	amroutine->amendscan = ybcinendscan;
+	amroutine->ammarkpos = NULL; /* TODO: support mark/restore pos with ordering */
+	amroutine->amrestrpos = NULL;
+	amroutine->amestimateparallelscan = yb_estimate_parallel_size;
+	amroutine->aminitparallelscan = yb_init_partition_key_data;
+	amroutine->amparallelrescan = NULL;
+	amroutine->yb_aminsert = ybcininsert;
+	amroutine->yb_amdelete = ybcindelete;
+	amroutine->yb_ambackfill = ybcinbackfill;
+	amroutine->yb_ammightrecheck = ybcinmightrecheck;
+	amroutine->yb_amgetbitmap = ybcgetbitmap;
+
+	PG_RETURN_POINTER(amroutine);
 }

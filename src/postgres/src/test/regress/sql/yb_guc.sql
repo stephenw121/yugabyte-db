@@ -24,6 +24,22 @@ set yb_transaction_priority_upper_bound = 0.6;
 set yb_transaction_priority_lower_bound = 0.4;
 set yb_transaction_priority_lower_bound = 0.6;
 
+-- Test yb_fetch_row_limit
+set yb_fetch_row_limit = 100;
+show yb_fetch_row_limit;
+
+set yb_fetch_row_limit = -1;  -- ERROR since yb_fetch_row_limit must be non-negative.
+
+-- Test yb_fetch_size_limit
+set yb_fetch_size_limit = '2MB';
+show yb_fetch_size_limit;
+set yb_fetch_size_limit = 789;
+show yb_fetch_size_limit;
+set yb_fetch_size_limit = 2048;
+show yb_fetch_size_limit;
+
+set yb_fetch_size_limit = -1;  -- ERROR since yb_fetch_size_limit must be non-negative.
+
 -- Check enable_seqscan, enable_indexscan, enable_indexonlyscan for YB scans.
 CREATE TABLE test_scan (i int, j int);
 CREATE INDEX NONCONCURRENTLY ON test_scan (j);
@@ -32,21 +48,31 @@ CREATE INDEX NONCONCURRENTLY ON test_scan (j);
 set enable_seqscan = on;
 set enable_indexscan = on;
 set enable_indexonlyscan = on;
+set enable_bitmapscan = on;
 EXPLAIN SELECT * FROM test_scan;
 EXPLAIN SELECT * FROM test_scan WHERE j = 1;
 EXPLAIN SELECT j FROM test_scan;
 set enable_seqscan = on;
 set enable_indexscan = off;
+set enable_bitmapscan = off;
 EXPLAIN SELECT * FROM test_scan;
 EXPLAIN SELECT * FROM test_scan WHERE j = 1;
 EXPLAIN SELECT j FROM test_scan;
 set enable_seqscan = off;
 set enable_indexscan = off;
+set enable_bitmapscan = off;
 EXPLAIN SELECT * FROM test_scan;
 EXPLAIN SELECT * FROM test_scan WHERE j = 1;
 EXPLAIN SELECT j FROM test_scan;
 set enable_seqscan = off;
 set enable_indexscan = on;
+set enable_bitmapscan = off;
+EXPLAIN SELECT * FROM test_scan;
+EXPLAIN SELECT * FROM test_scan WHERE j = 1;
+EXPLAIN SELECT j FROM test_scan;
+set enable_seqscan = off;
+set enable_indexscan = off;
+set enable_bitmapscan = on;
 EXPLAIN SELECT * FROM test_scan;
 EXPLAIN SELECT * FROM test_scan WHERE j = 1;
 EXPLAIN SELECT j FROM test_scan;
@@ -59,7 +85,7 @@ EXPLAIN SELECT j FROM test_scan;
 -- yb_transaction_priority to be equal to those two.
 set yb_transaction_priority_lower_bound = 0.4;
 set yb_transaction_priority_upper_bound = 0.4;
-BEGIN TRANSACTION;
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 INSERT INTO test_scan (i, j) values (1, 1), (2, 2), (3, 3);
 show yb_transaction_priority;
 COMMIT;
@@ -70,7 +96,7 @@ set yb_transaction_priority = 0.3; -- ERROR
 -- High priority transaction
 set yb_transaction_priority_lower_bound = 0.4;
 set yb_transaction_priority_upper_bound = 0.4;
-BEGIN TRANSACTION;
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 SELECT i, j FROM test_scan WHERE i = 1 FOR UPDATE;
 show yb_transaction_priority;
 COMMIT;
@@ -78,7 +104,7 @@ COMMIT;
 -- Highest priority transaction
 set yb_transaction_priority_upper_bound = 1;
 set yb_transaction_priority_lower_bound = 1;
-BEGIN TRANSACTION;
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 SELECT i, j FROM test_scan WHERE i = 1 FOR UPDATE;
 show yb_transaction_priority;
 COMMIT;

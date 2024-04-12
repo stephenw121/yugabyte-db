@@ -1,17 +1,15 @@
 ---
 title: DocDB replication layer
 headerTitle: DocDB replication layer
-linkTitle: DocDB replication layer
+linkTitle: Replication
 description: Learn how synchronous and asynchronous replication work in DocDB, including advanced features like xCluster replication and read replicas.
 image: /images/section_icons/architecture/concepts.png
-aliases:
-  - /preview/architecture/docdb/replication/
 headcontent: Learn how synchronous and asynchronous replication work in DocDB.
 menu:
   preview:
     identifier: architecture-docdb-replication
     parent: architecture
-    weight: 1135
+    weight: 800
 type: indexpage
 ---
 
@@ -19,8 +17,8 @@ This section describes how replication works in DocDB. The data in a DocDB table
 
 YugabyteDB also provides other advanced replication features. These include two forms of asynchronous replication of data:
 
-* **xCluster** Data is asynchronously replicated between different YugabyteDB clusters - both unidirectional replication (master-slave) or  bidirectional replication across two clusters.
-* **Read replicas** The in-cluster asynchronous replicas are called read replicas.
+* **xCluster** - Data is asynchronously replicated between different YugabyteDB universes - both unidirectional replication (master-slave) or bidirectional replication across two universes.
+* **Read replicas** - The in-universe asynchronous replicas are called read replicas.
 
 The YugabyteDB synchronous replication architecture is inspired by <a href="https://research.google.com/archive/spanner-osdi2012.pdf">Google Spanner</a>.
 
@@ -28,41 +26,22 @@ The YugabyteDB xCluster replication architecture is inspired by RDBMS databases 
 
 <div class="row">
 
-  <div class="col-12 col-md-6 col-lg-12 col-xl-6">
-    <a class="section-link icon-offset" href="replication/">
-      <div class="head">
-        <img class="icon" src="/images/section_icons/architecture/concepts/replication.png" aria-hidden="true" />
-        <div class="title">Default synchronous replication</div>
-      </div>
-      <div class="body">
-        In-cluster synchronous replication with Raft consensus.
-      </div>
-    </a>
-  </div>
+  {{<index/item
+    title="Default synchronous replication"
+    body="In-primary-cluster synchronous replication with Raft consensus."
+    href="replication/"
+    icon="/images/section_icons/architecture/concepts/replication.png">}}
 
-  <div class="col-12 col-md-6 col-lg-12 col-xl-6">
-    <a class="section-link icon-offset" href="async-replication/">
-      <div class="head">
-        <img class="icon" src="/images/section_icons/architecture/concepts/replication.png" aria-hidden="true" />
-        <div class="title">xCluster</div>
-      </div>
-      <div class="body">
-        Cross-cluster asynchronous replication of data.
-      </div>
-    </a>
-  </div>
+  {{<index/item
+    title="xCluster"
+    body="Cross-universe asynchronous replication of data."
+    href="async-replication/"
+    icon="/images/section_icons/architecture/concepts/replication.png">}}
 
-  <div class="col-12 col-md-6 col-lg-12 col-xl-6">
-    <a class="section-link icon-offset" href="read-replicas/">
-      <div class="head">
-        <img class="icon" src="/images/section_icons/architecture/concepts/replication.png" aria-hidden="true" />
-        <div class="title">Read replicas</div>
-      </div>
-      <div class="body">
-        In-cluster asynchronous replicas to enable reading data that is a bit stale with lower read latencies.
-      </div>
-    </a>
-  </div>
-
+  {{<index/item
+    title="Read replicas"
+    body="In-universe asynchronous replicas to enable reading data that is a bit stale with lower read latencies."
+    href="read-replicas/"
+    icon="/images/section_icons/architecture/concepts/replication.png">}}
 
 </div>

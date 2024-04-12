@@ -27,9 +27,8 @@ import lombok.extern.slf4j.Slf4j;
 public class AnsibleDestroyServer extends NodeTaskBase {
 
   @Inject
-  protected AnsibleDestroyServer(
-      BaseTaskDependencies baseTaskDependencies, NodeManager nodeManager) {
-    super(baseTaskDependencies, nodeManager);
+  protected AnsibleDestroyServer(BaseTaskDependencies baseTaskDependencies) {
+    super(baseTaskDependencies);
   }
 
   public static class Params extends NodeTaskParams {
@@ -41,6 +40,8 @@ public class AnsibleDestroyServer extends NodeTaskBase {
     public boolean deleteRootVolumes = false;
     // IP of node to be deleted.
     public String nodeIP = null;
+    // Flag, indicating OpenTelemetry Collector is installed on the DB node.
+    public boolean otelCollectorInstalled = false;
   }
 
   @Override
@@ -49,7 +50,7 @@ public class AnsibleDestroyServer extends NodeTaskBase {
   }
 
   private void removeNodeFromUniverse(final String nodeName) {
-    Universe u = Universe.getOrBadRequest(taskParams().universeUUID);
+    Universe u = Universe.getOrBadRequest(taskParams().getUniverseUUID());
     if (u.getNode(nodeName) == null) {
       log.error("No node in universe with name " + nodeName);
       return;
@@ -61,7 +62,8 @@ public class AnsibleDestroyServer extends NodeTaskBase {
           public void run(Universe universe) {
             UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
             universeDetails.removeNode(nodeName);
-            log.debug("Removing node " + nodeName + " from universe " + taskParams().universeUUID);
+            log.debug(
+                "Removing node " + nodeName + " from universe " + taskParams().getUniverseUUID());
           }
         };
 
@@ -70,6 +72,8 @@ public class AnsibleDestroyServer extends NodeTaskBase {
 
   @Override
   public void run() {
+    boolean cleanupFailed = false;
+
     // Execute the ansible command.
     try {
       getNodeManager()
@@ -79,6 +83,7 @@ public class AnsibleDestroyServer extends NodeTaskBase {
       if (!taskParams().isForceDelete) {
         throw e;
       } else {
+        cleanupFailed = true;
         log.debug(
             "Ignoring error deleting instance {} due to isForceDelete being set.",
             taskParams().nodeName,
@@ -86,7 +91,7 @@ public class AnsibleDestroyServer extends NodeTaskBase {
       }
     }
 
-    Universe u = Universe.getOrBadRequest(taskParams().universeUUID);
+    Universe u = Universe.getOrBadRequest(taskParams().getUniverseUUID());
     UserIntent userIntent =
         u.getUniverseDetails()
             .getClusterByUuid(u.getNode(taskParams().nodeName).placementUuid)
@@ -112,18 +117,38 @@ public class AnsibleDestroyServer extends NodeTaskBase {
 
     NodeDetails univNodeDetails = u.getNode(taskParams().nodeName);
 
+    try {
+      deleteNodeAgent(univNodeDetails);
+    } catch (Exception e) {
+      if (!taskParams().isForceDelete) {
+        throw e;
+      } else {
+        log.debug(
+            "Ignoring error deleting node agent {} due to isForceDelete being set.",
+            taskParams().nodeName,
+            e);
+      }
+    }
+
     if (userIntent.providerType.equals(Common.CloudType.onprem)
         && univNodeDetails.state != NodeDetails.NodeState.Decommissioned) {
       // Free up the node.
       try {
         NodeInstance providerNode = NodeInstance.getByName(taskParams().nodeName);
-        providerNode.clearNodeDetails();
+        if (cleanupFailed) {
+          log.info(
+              "Failed to clean node instance {}. Setting to decommissioned state",
+              taskParams().nodeName);
+          providerNode.setToFailedCleanup(u, univNodeDetails);
+        } else {
+          providerNode.clearNodeDetails();
+          log.info("Marked node instance {} as available", taskParams().nodeName);
+        }
       } catch (Exception e) {
         if (!taskParams().isForceDelete) {
           throw e;
         }
       }
-      log.info("Marked node instance {} as available", taskParams().nodeName);
     }
 
     if (taskParams().deleteNode) {

@@ -15,16 +15,19 @@
 
 #include "yb/yql/pgwrapper/pg_mini_test_base.h"
 
+#include "yb/util/scope_exit.h"
 #include "yb/util/sync_point.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_thread_holder.h"
 #include "yb/util/tsan_util.h"
 
+using std::string;
+
 using namespace std::literals;
 
 DECLARE_bool(TEST_fail_in_apply_if_no_metadata);
-DECLARE_bool(TEST_follower_pause_update_consensus_requests);
 DECLARE_bool(yb_enable_read_committed_isolation);
+DECLARE_bool(enable_wait_queues);
 
 namespace yb {
 namespace pgwrapper {
@@ -33,14 +36,17 @@ class PgTxnTest : public PgMiniTestBase {
 
  protected:
   void AssertEffectiveIsolationLevel(PGConn* conn, const string& expected) {
-    auto value = ASSERT_RESULT(
-        conn->FetchValue<std::string>("SHOW yb_effective_transaction_isolation_level"));
-    ASSERT_EQ(value, expected);
+    auto value_from_deprecated_guc = ASSERT_RESULT(
+        conn->FetchRow<std::string>("SHOW yb_effective_transaction_isolation_level"));
+    auto value_from_proc = ASSERT_RESULT(
+        conn->FetchRow<std::string>("SELECT yb_get_effective_transaction_isolation_level()"));
+    ASSERT_EQ(value_from_deprecated_guc, value_from_proc);
+    ASSERT_EQ(value_from_deprecated_guc, expected);
   }
 };
 
 TEST_F(PgTxnTest, YB_DISABLE_TEST_IN_SANITIZERS(EmptyUpdate)) {
-  FLAGS_TEST_fail_in_apply_if_no_metadata = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_fail_in_apply_if_no_metadata) = true;
 
   auto conn = ASSERT_RESULT(Connect());
 
@@ -51,6 +57,18 @@ TEST_F(PgTxnTest, YB_DISABLE_TEST_IN_SANITIZERS(EmptyUpdate)) {
 }
 
 TEST_F(PgTxnTest, YB_DISABLE_TEST_IN_SANITIZERS(ShowEffectiveYBIsolationLevel)) {
+  auto original_read_committed_setting = FLAGS_yb_enable_read_committed_isolation;
+
+  // Ensure the original setting is restored at the end of this scope
+  auto scope_exit = ScopeExit([original_read_committed_setting]() {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_yb_enable_read_committed_isolation) =
+        original_read_committed_setting;
+  });
+
+  if (FLAGS_yb_enable_read_committed_isolation) {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_yb_enable_read_committed_isolation) = false;
+    ASSERT_OK(RestartCluster());
+  }
 
   auto conn = ASSERT_RESULT(Connect());
   AssertEffectiveIsolationLevel(&conn, "repeatable read");
@@ -91,7 +109,7 @@ TEST_F(PgTxnTest, YB_DISABLE_TEST_IN_SANITIZERS(ShowEffectiveYBIsolationLevel)) 
   AssertEffectiveIsolationLevel(&conn, "serializable");
   ASSERT_OK(conn.Execute("ROLLBACK"));
 
-  FLAGS_yb_enable_read_committed_isolation = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_yb_enable_read_committed_isolation) = true;
   ASSERT_OK(RestartCluster());
 
   conn = ASSERT_RESULT(Connect());
@@ -125,18 +143,28 @@ class PgTxnRF1Test : public PgTxnTest {
   }
 };
 
-TEST_F_EX(PgTxnTest, YB_DISABLE_TEST_IN_TSAN(SelectRF1ReadOnlyDeferred), PgTxnRF1Test) {
+TEST_F_EX(PgTxnTest, SelectRF1ReadOnlyDeferred, PgTxnRF1Test) {
   auto conn = ASSERT_RESULT(Connect());
 
   ASSERT_OK(conn.Execute("CREATE TABLE test (key INT)"));
   ASSERT_OK(conn.Execute("INSERT INTO test VALUES (1)"));
   ASSERT_OK(conn.Execute("BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE"));
-  auto res = ASSERT_RESULT(conn.FetchValue<int32_t>("SELECT * FROM test"));
+  auto res = ASSERT_RESULT(conn.FetchRow<int32_t>("SELECT * FROM test"));
   ASSERT_EQ(res, 1);
   ASSERT_OK(conn.Execute("COMMIT"));
 }
 
-TEST_F(PgTxnTest, YB_DISABLE_TEST_IN_TSAN(SerializableReadWriteConflicts)) {
+class PgTxnTestFailOnConflict : public PgTxnTest {
+ protected:
+  void SetUp() override {
+    // This test depends on fail-on-conflict concurrency control to perform its validation.
+    // TODO(wait-queues): https://github.com/yugabyte/yugabyte-db/issues/17871
+    EnableFailOnConflict();
+    PgTxnTest::SetUp();
+  }
+};
+
+TEST_F_EX(PgTxnTest, SerializableReadWriteConflicts, PgTxnTestFailOnConflict) {
   auto conn1 = ASSERT_RESULT(Connect());
   auto conn2 = ASSERT_RESULT(Connect());
   constexpr double kPriorityBound = 0.5;
@@ -155,7 +183,7 @@ TEST_F(PgTxnTest, YB_DISABLE_TEST_IN_TSAN(SerializableReadWriteConflicts)) {
 // Test concurrently insert increasing values, and in parallel perform read of several recent
 // values.
 // Checking that reads could be serialized.
-TEST_F(PgTxnTest, YB_DISABLE_TEST_IN_TSAN(ReadRecentSet)) {
+TEST_F(PgTxnTest, ReadRecentSet) {
   auto conn = ASSERT_RESULT(Connect());
   constexpr int kWriters = 16;
   constexpr int kReaders = 16;
@@ -225,8 +253,9 @@ TEST_F(PgTxnTest, YB_DISABLE_TEST_IN_TSAN(ReadRecentSet)) {
           p = FastInt64ToBufferLeft(v, p);
         }
         ASSERT_OK(connection.StartTransaction(IsolationLevel::SERIALIZABLE_ISOLATION));
-        auto res = connection.FetchFormat("SELECT value FROM test WHERE value in ($0)", str_buffer);
-        if (!res.ok()) {
+        auto values_res = connection.FetchRows<int32_t>(
+            Format("SELECT value FROM test WHERE value in ($0)", str_buffer));
+        if (!values_res.ok()) {
           ASSERT_OK(connection.RollbackTransaction());
           continue;
         }
@@ -236,10 +265,10 @@ TEST_F(PgTxnTest, YB_DISABLE_TEST_IN_TSAN(ReadRecentSet)) {
           continue;
         }
         uint64_t mask = 0;
-        for (int j = 0, count = PQntuples(res->get()); j != count; ++j) {
-          mask |= 1ULL << (ASSERT_RESULT(GetInt32(res->get(), j, 0)) - read_min);
+        for (const auto& value : *values_res) {
+          mask |= 1ULL << (value - read_min);
         }
-        std::lock_guard<std::mutex> lock(reads_mutex);
+        std::lock_guard lock(reads_mutex);
         Read new_read{read_min, mask};
         reads.erase(std::remove_if(reads.begin(), reads.end(),
             [&new_read, &stop](const auto& old_read) {
@@ -306,7 +335,9 @@ TEST_F(PgTxnTest, YB_DISABLE_TEST_IN_TSAN(ReadRecentSet)) {
 //
 // Important note -- sync point only works in debug mode. Non-debug test runs may not catch these
 // issues as reliably.
-TEST_F(PgTxnTest, YB_DISABLE_TEST_IN_TSAN(SelectForUpdateExclusiveRead)) {
+TEST_F_EX( PgTxnTest, SelectForUpdateExclusiveRead, PgTxnTestFailOnConflict) {
+  // Note -- we disable wait-on-conflict behavior here because this regression test is specifically
+  // targeting a bug in fail-on-conflict behavior.
   constexpr int kNumThreads = 10;
   constexpr int kNumSleepSeconds = 1;
   TestThreadHolder thread_holder;
@@ -340,7 +371,7 @@ TEST_F(PgTxnTest, YB_DISABLE_TEST_IN_TSAN(SelectForUpdateExclusiveRead)) {
       // then we should expect one RPC thread to hold the lock for 10s while the others wait for
       // the sync point in this test to be hit. Then, each RPC thread should proceed in serial after
       // that, acquiring the lock and resolving conflicts.
-      auto res = conn.FetchValue<int>("SELECT value FROM test WHERE key=1 FOR UPDATE");
+      auto res = conn.FetchRow<int32_t>("SELECT value FROM test WHERE key=1 FOR UPDATE");
 
       read_succeeded[thread_idx] = res.ok();
       LOG(INFO) << "Thread read " << thread_idx << (res.ok() ? " succeeded" : " failed");

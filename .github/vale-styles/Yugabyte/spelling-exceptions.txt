@@ -46,6 +46,7 @@ autoscaled
 autoscaler
 autoscales
 autoscaling
+Avro
 awardable
 awardables
 Axios
@@ -58,6 +59,7 @@ backport
 backported
 backporting
 backports
+backquote
 backtrace
 backtraced
 backtraces
@@ -111,6 +113,7 @@ Citrix
 Citus
 clonable
 Cloudwatch
+CMake
 Cobertura
 Codepen
 Cognito
@@ -123,7 +126,9 @@ Conda
 Consul
 Contentful
 Corosync
+Couchbase
 Coursier
+CPUs
 cron
 cronjob
 cronjobs
@@ -134,11 +139,16 @@ crosslinked
 crosslinking
 crosslinks
 Crossplane
+crosstab
 CrowdIn
 CSV
+Cutover
+cutover
 cybersecurity
 Dangerfile
 Datadog
+datacenter
+datacenters
 datasource
 datasources
 datetime
@@ -264,6 +274,7 @@ hardcode
 hardcoded
 hardcodes
 Hashicorp
+Hasura
 Haswell
 heatmap
 heatmaps
@@ -273,6 +284,7 @@ Heroku
 Herokuish
 Hexo
 HipChat
+HLCs
 hostname
 hostnames
 hotfix
@@ -618,6 +630,8 @@ sparklines
 spidering
 Splunk
 SpotBugs
+SQLAlchemy
+SSDs
 Stackdriver
 Stackprof
 starrer
@@ -721,6 +735,7 @@ Twilio
 Twitter
 TypeScript
 Ubuntu
+UDTs
 ulimit
 unapplied
 unapprove
@@ -817,6 +832,7 @@ unverify
 unverifying
 uploader
 uploaders
+upsert
 upstreams
 upvote
 upvoted
@@ -827,12 +843,16 @@ UUIDs
 Vagrantfile
 validator
 validators
+vCPU
+vCPUs
 vendored
 versionless
 viewport
 viewports
 virtualized
 virtualizing
+Vitess
+VPCs
 Vue
 Vuex
 walkthrough
@@ -858,9 +878,12 @@ Worldline
 xCluster
 Xcode
 Xeon
+YBase
 ycqlsh
 YouTrack
 ysqlsh
+ysql_dump
+ysql_dumpall
 ytt
 Yubico
 Yugabyte

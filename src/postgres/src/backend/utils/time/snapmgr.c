@@ -377,11 +377,15 @@ GetTransactionSnapshot(void)
 	 *
 	 * READ COMMITTED semantics don't apply to DDLs.
 	 */
-	if (IsYBReadCommitted() && YBGetDdlNestingLevel() == 0)
+	if (IsYBReadCommitted() && !YBCPgIsDdlMode())
 	{
-		elog(LOG, "Resetting read point for statement in Read Committed txn");
 		HandleYBStatus(YBCPgFlushBufferedOperations());
-		HandleYBStatus(YBCPgResetTransactionReadPoint());
+		/* If this is a retry for a kReadRestart error, avoid resetting the read point */
+		if (!YBCIsRestartReadPointRequested())
+		{
+			elog(DEBUG2, "Resetting read point for statement in Read Committed txn");
+			HandleYBStatus(YBCPgResetTransactionReadPoint());
+		}
 	}
 
 	return CurrentSnapshot;
@@ -608,13 +612,25 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
 	CurrentSnapshot->xmin = sourcesnap->xmin;
 	CurrentSnapshot->xmax = sourcesnap->xmax;
 	CurrentSnapshot->xcnt = sourcesnap->xcnt;
-	Assert(sourcesnap->xcnt <= GetMaxSnapshotXidCount());
-	memcpy(CurrentSnapshot->xip, sourcesnap->xip,
-		   sourcesnap->xcnt * sizeof(TransactionId));
+	/*
+	 * In Yugabyte it is valid if the snapshot's xip is NULL, but memcpy's
+	 * arguments are supposed to be not null. Even when Yugabyte is not enabled,
+	 * if xcnt is 0, it is good to skip those no-op lines.
+	 */
+	if (sourcesnap->xcnt)
+	{
+		Assert(sourcesnap->xcnt <= GetMaxSnapshotXidCount());
+		memcpy(CurrentSnapshot->xip, sourcesnap->xip,
+			   sourcesnap->xcnt * sizeof(TransactionId));
+	}
+	/* Similar for subxip/subxcnt */
 	CurrentSnapshot->subxcnt = sourcesnap->subxcnt;
-	Assert(sourcesnap->subxcnt <= GetMaxSnapshotSubxidCount());
-	memcpy(CurrentSnapshot->subxip, sourcesnap->subxip,
-		   sourcesnap->subxcnt * sizeof(TransactionId));
+	if (sourcesnap->subxcnt)
+	{
+		Assert(sourcesnap->subxcnt <= GetMaxSnapshotSubxidCount());
+		memcpy(CurrentSnapshot->subxip, sourcesnap->subxip,
+			   sourcesnap->subxcnt * sizeof(TransactionId));
+	}
 	CurrentSnapshot->suboverflowed = sourcesnap->suboverflowed;
 	CurrentSnapshot->takenDuringRecovery = sourcesnap->takenDuringRecovery;
 	/* NB: curcid should NOT be copied, it's a local matter */

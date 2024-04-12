@@ -2,7 +2,6 @@
 title: Queries and joins
 linkTitle: Queries and joins
 description: Queries and joins in YSQL
-image: /images/section_icons/secure/create-roles.png
 menu:
   preview:
     identifier: explore-ysql-language-features-queries-joins
@@ -38,6 +37,8 @@ The following `SELECT` statement clauses provide flexibility and allow you to fi
 - The `INNER JOIN`, `LEFT JOIN`, `FULL OUTER JOIN`, and `CROSS JOIN` clauses let you create joins with other tables.
 
 ### SELECT examples
+
+{{% explore-setup-single %}}
 
 Suppose you work with a database that includes the following table populated with data:
 

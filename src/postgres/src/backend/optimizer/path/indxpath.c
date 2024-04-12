@@ -25,7 +25,9 @@
 #include "catalog/pg_opfamily.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "executor/ybcExpr.h"
 #include "nodes/makefuncs.h"
+#include "optimizer/planmain.h"
 #include "pg_yb_utils.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
@@ -34,6 +36,7 @@
 #include "optimizer/predtest.h"
 #include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/tlist.h"
 #include "optimizer/var.h"
 #include "utils/builtins.h"
 #include "utils/bytea.h"
@@ -109,9 +112,11 @@ static bool eclass_already_used(EquivalenceClass *parent_ec, Relids oldrelids,
 static bool bms_equal_any(Relids relids, List *relids_list);
 static void get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 				IndexOptInfo *index, IndexClauseSet *clauses,
+				List *yb_bitmap_idx_pushdowns,
 				List **bitindexpaths);
 static List *build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 				  IndexOptInfo *index, IndexClauseSet *clauses,
+				  List *yb_bitmap_idx_pushdowns,
 				  bool useful_predicate,
 				  ScanTypeControl scantype,
 				  bool *skip_nonnative_saop,
@@ -125,6 +130,8 @@ static Path *choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel,
 static int	path_usage_comparator(const void *a, const void *b);
 static Cost bitmap_scan_cost_est(PlannerInfo *root, RelOptInfo *rel,
 					 Path *ipath);
+static Cost yb_bitmap_scan_cost_est(PlannerInfo *root, RelOptInfo *rel,
+					 Path *ipath);
 static Cost bitmap_and_cost_est(PlannerInfo *root, RelOptInfo *rel,
 					List *paths);
 static PathClauseUsage *classify_index_clause_usage(Path *path,
@@ -132,7 +139,6 @@ static PathClauseUsage *classify_index_clause_usage(Path *path,
 static void find_indexpath_quals(Path *bitmapqual, List **quals, List **preds);
 static int	find_list_position(Node *node, List **nodelist);
 static bool check_index_only(RelOptInfo *rel, IndexOptInfo *index);
-static double get_loop_count(PlannerInfo *root, Index cur_relid, Relids outer_relids);
 static double adjust_rowcount_for_semijoins(PlannerInfo *root,
 							  Index cur_relid,
 							  Index outer_relid,
@@ -150,10 +156,12 @@ static void match_eclass_clauses_to_index(PlannerInfo *root,
 							  IndexClauseSet *clauseset);
 static void match_clauses_to_index(IndexOptInfo *index,
 					   List *clauses,
-					   IndexClauseSet *clauseset);
+					   IndexClauseSet *clauseset,
+					   List **yb_bitmap_idx_pushdowns);
 static void match_clause_to_index(IndexOptInfo *index,
 					  RestrictInfo *rinfo,
-					  IndexClauseSet *clauseset);
+					  IndexClauseSet *clauseset,
+					  List **yb_bitmap_idx_pushdowns);
 static bool match_clause_to_indexcol(IndexOptInfo *index,
 						 int indexcol,
 						 RestrictInfo *rinfo);
@@ -191,6 +199,7 @@ static List *network_prefix_quals(Node *leftop, Oid expr_op, Oid opfamily,
 static Datum string_to_datum(const char *str, Oid datatype);
 static Const *string_to_const(const char *str, Oid datatype);
 static bool is_hash_column_in_lsm_index(const IndexOptInfo* index, int columnIndex);
+static bool yb_can_pushdown_distinct(PlannerInfo *root, IndexOptInfo *index);
 
 /*
  * create_index_paths()
@@ -211,6 +220,7 @@ static bool is_hash_column_in_lsm_index(const IndexOptInfo* index, int columnInd
  * the inner relation of a nestloop join; it can't be used on the outer side,
  * nor in a merge or hash join.  In that context, values for the other rels'
  * attributes are available and fixed during any one scan of the indexpath.
+ * YB: Values are not fixed in batched nested loop joins by nature of a batch.
  *
  * An IndexPath is generated and submitted to add_path() for each plain or
  * parameterized index scan this routine deems potentially interesting for
@@ -276,6 +286,7 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 		 * bitmap paths are added to bitindexpaths to be handled below.
 		 */
 		get_index_paths(root, rel, index, &rclauseset,
+						NIL /* yb_bitmap_idx_pushdowns */,
 						&bitindexpaths);
 
 		/*
@@ -333,17 +344,29 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 	 */
 	if (bitindexpaths != NIL)
 	{
-		Path	   *bitmapqual;
-		BitmapHeapPath *bpath;
-
+		Path *bitmapqual;
 		bitmapqual = choose_bitmap_and(root, rel, bitindexpaths);
-		bpath = create_bitmap_heap_path(root, rel, bitmapqual,
-										rel->lateral_relids, 1.0, 0);
-		add_path(rel, (Path *) bpath);
 
-		/* create a partial bitmap heap path */
-		if (rel->consider_parallel && rel->lateral_relids == NULL)
-			create_partial_bitmap_paths(root, rel, bitmapqual);
+		if (IsYugaByteEnabled() && rel->is_yb_relation)
+		{
+			YbBitmapTablePath *bpath;
+			bpath = create_yb_bitmap_table_path(root, rel, bitmapqual,
+												rel->lateral_relids, 1.0, 0);
+			add_path(rel, (Path *) bpath);
+
+			/* TODO(#20575): support parallel bitmap scans */
+		}
+		else
+		{
+			BitmapHeapPath *bpath;
+			bpath = create_bitmap_heap_path(root, rel, bitmapqual,
+											rel->lateral_relids, 1.0, 0);
+			add_path(rel, (Path *) bpath);
+
+			/* create a partial bitmap heap path */
+			if (rel->consider_parallel && rel->lateral_relids == NULL)
+				create_partial_bitmap_paths(root, rel, bitmapqual);
+		}
 	}
 
 	/*
@@ -380,7 +403,7 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 			Path	   *bitmapqual;
 			Relids		required_outer;
 			double		loop_count;
-			BitmapHeapPath *bpath;
+			Path	   *bpath;
 			ListCell   *lcp;
 
 			/* Identify all the bitmap join paths needing no more than that */
@@ -405,9 +428,18 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 			/* And push that path into the mix */
 			required_outer = PATH_REQ_OUTER(bitmapqual);
 			loop_count = get_loop_count(root, rel->relid, required_outer);
-			bpath = create_bitmap_heap_path(root, rel, bitmapqual,
-											required_outer, loop_count, 0);
-			add_path(rel, (Path *) bpath);
+
+			if (IsYugaByteEnabled() && rel->is_yb_relation)
+				bpath = (Path *) create_yb_bitmap_table_path(root, rel,
+															 bitmapqual,
+															 required_outer,
+															 loop_count, 0);
+
+			else
+				bpath = (Path *) create_bitmap_heap_path(root, rel, bitmapqual,
+														 required_outer,
+														 loop_count, 0);
+			add_path(rel, bpath);
 		}
 	}
 }
@@ -581,7 +613,7 @@ consider_index_join_outer_rels(PlannerInfo *root, RelOptInfo *rel,
 	}
 }
 
-static void
+static bool
 yb_get_batched_index_paths(PlannerInfo *root, RelOptInfo *rel,
 						   IndexOptInfo *index, IndexClauseSet *clauses,
 						   List **bitindexpaths)
@@ -594,10 +626,13 @@ yb_get_batched_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	Relids batchedrelids = NULL;
 	Relids unbatchablerelids = NULL;
 
-	Relids batched_inner_attnos = NULL;
+	Bitmapset *batched_inner_attnos = NULL;
 
 	List *batched_rinfos = NIL;
 
+	Relids inner_relids = bms_make_singleton(index->rel->relid);
+
+	bool batched_paths_added = false;
 
 	for (size_t i = 0; i < INDEX_MAX_KEYS && clauses->nonempty; i++)
 	{
@@ -611,16 +646,17 @@ yb_get_batched_index_paths(PlannerInfo *root, RelOptInfo *rel,
 			 * We are prohibiting batching outer rels that have already
 			 * been batched in the interest of simplicity for now.
 			 */
-			Relids inner_relids = bms_make_singleton(index->rel->relid);
 			Relids outer_relids =
 				bms_difference(rinfo->required_relids, inner_relids);
-			RestrictInfo *tmp_batched = get_batched_restrictinfo(rinfo, outer_relids, inner_relids);
+			RestrictInfo *tmp_batched = NULL;
 
-			/* Disabling batching the same rel twice for now. */
-			if (tmp_batched &&
-				bms_overlap(tmp_batched->right_relids, batchedrelids))
-				tmp_batched = NULL;
-			
+			/* TODO: We don't support expression indexes yet. */
+			if (index->indexkeys[i] != 0)
+			{
+				tmp_batched =
+					yb_get_batched_restrictinfo(rinfo, outer_relids, inner_relids);
+			}
+
 			/* Disabling batching the same inner attno twice for now. */
 			if (tmp_batched)
 			{
@@ -634,7 +670,7 @@ yb_get_batched_index_paths(PlannerInfo *root, RelOptInfo *rel,
 				bms_free(attnos);
 			}
 
-			if (tmp_batched != NULL)
+			if (tmp_batched)
 			{
 				batchedrelids =
 					bms_union(batchedrelids,
@@ -648,7 +684,7 @@ yb_get_batched_index_paths(PlannerInfo *root, RelOptInfo *rel,
 			}
 			else
 			{
-				/* 
+				/*
 				 * Couldn't batch this clause so its outer rels are not
 				 * batchable.
 				 */
@@ -660,8 +696,73 @@ yb_get_batched_index_paths(PlannerInfo *root, RelOptInfo *rel,
 
 	batchedrelids = bms_del_member(batchedrelids,
 								   index->rel->relid);
+	batchedrelids = bms_difference(batchedrelids, unbatchablerelids);
+
+	/* See if we have any unbatchable filters. */
+	Relids batched_and_inner_relids =
+		bms_union(batchedrelids, index->rel->relids);
+	List *pclauses = NIL;
+	if (!bms_is_empty(batchedrelids)) {
+		pclauses = generate_join_implied_equalities(
+			root,
+			bms_union(batchedrelids, index->rel->relids),
+			batchedrelids,
+			rel);
+
+		foreach(lc, rel->joininfo)
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+			if (join_clause_is_movable_into(rinfo, rel->relids,
+											batched_and_inner_relids))
+				pclauses = lappend(pclauses, rinfo);
+		}
+	}
+
+	foreach(lc, pclauses)
+	{
+		RestrictInfo *rinfo = lfirst(lc);
+		RestrictInfo *batched =
+			yb_get_batched_restrictinfo(rinfo,
+									 batchedrelids,
+									 index->rel->relids);
+		if (!bms_overlap(rinfo->clause_relids, batchedrelids))
+			continue;
+
+		Assert(bms_overlap(rinfo->clause_relids, batchedrelids));
+		/*
+		 * If an unbatchable clause involves a batched relid, stop that relid
+		 * from being batched.
+		 */
+		if (!batched)
+		{
+			unbatchablerelids = bms_union(unbatchablerelids,
+										  rinfo->clause_relids);
+			continue;
+		}
+
+		/*
+		 * Make sure we don't allow any clauses that involve a batched relid
+		 * and an attno not in batched_inner_attnos.
+		 */
+		Assert(batched);
+		Node *innervar = get_leftop(batched->clause);
+		Bitmapset *attnos = NULL;
+		pull_varattnos(innervar,
+						index->rel->relid,
+						&attnos);
+		if (!bms_is_subset(attnos, batched_inner_attnos))
+			unbatchablerelids = bms_union(unbatchablerelids,
+											rinfo->clause_relids);
+	}
+
+	bms_free(batched_and_inner_relids);
+
 	unbatchablerelids = bms_del_member(unbatchablerelids,
 									   index->rel->relid);
+	batchedrelids = bms_difference(batchedrelids, unbatchablerelids);
+
+	Assert(!root->yb_cur_batched_relids);
+	root->yb_cur_batched_relids = batchedrelids;
 
 	/*
 	 * Build simple index paths using the clauses.  Allow ScalarArrayOpExpr
@@ -671,6 +772,7 @@ yb_get_batched_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	 */
 	indexpaths = build_index_paths(root, rel,
 								   index, clauses,
+								   NIL /* yb_bitmap_idx_pushdowns */,
 								   index->predOK,
 								   ST_ANYSCAN,
 								   &skip_nonnative_saop,
@@ -686,6 +788,7 @@ yb_get_batched_index_paths(PlannerInfo *root, RelOptInfo *rel,
 		indexpaths = list_concat(indexpaths,
 								 build_index_paths(root, rel,
 												   index, clauses,
+												   NIL /* yb_bitmap_idx_pushdowns */,
 												   index->predOK,
 												   ST_ANYSCAN,
 												   &skip_nonnative_saop,
@@ -707,61 +810,23 @@ yb_get_batched_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	foreach(lc, indexpaths)
 	{
 		IndexPath  *ipath = (IndexPath *) lfirst(lc);
-		ParamPathInfo *param_info = ipath->path.param_info;
-
-		if (param_info)
-		{
-			ListCell *lc2;
-			/* See if we have any unbatchable filters. */
-			foreach(lc2, param_info->ppi_clauses)
-			{
-				RestrictInfo *rinfo = lfirst(lc2);
-				RestrictInfo *batched =
-					get_batched_restrictinfo(rinfo,
-											 rinfo->required_relids,  index->rel->relids);
-				
-				/* See if we have already batched this filter. */
-				Relids left_var_attnos = NULL;
-				if (!batched ||
-					!bms_equal(batched->left_relids, index->rel->relids) ||
-					!bms_is_subset(batched->right_relids, batchedrelids))
-				{
-					unbatchablerelids = bms_union(unbatchablerelids,
-												  rinfo->clause_relids);
-				}
-
-				if (batched &&
-					bms_equal(batched->left_relids, index->rel->relids) &&
-					bms_is_subset(batched->right_relids, batchedrelids))
-				{
-					pull_varattnos(get_leftop(batched->clause),
-								   index->rel->relid,
-								   &left_var_attnos);
-					if (!bms_is_subset(left_var_attnos, batched_inner_attnos))
-						unbatchablerelids = bms_union(unbatchablerelids,
-												  	  rinfo->clause_relids);
-				}
-				bms_free(left_var_attnos);
-			}
-
-			unbatchablerelids = bms_del_member(unbatchablerelids,
-											   index->rel->relid);
-
-			batchedrelids = bms_difference(batchedrelids, unbatchablerelids);
-			/* Add batching info. */
-			param_info->yb_ppi_req_outer_batched = batchedrelids;
-			param_info->yb_ppi_req_outer_unbatched = unbatchablerelids;
-
-		}
 
 		if (index->amhasgettuple)
+		{
+			batched_paths_added = true;
 			add_path(rel, (Path *) ipath);
+		}
 
-		if (index->amhasgetbitmap &&
+		if (((index->amhasgetbitmap || index->yb_amhasgetbitmap) &&
+			 !IsA(ipath, UpperUniquePath)) &&
 			(ipath->path.pathkeys == NIL ||
 			 ipath->indexselectivity < 1.0))
 			*bitindexpaths = lappend(*bitindexpaths, ipath);
 	}
+
+	root->yb_cur_batched_relids = NULL;
+
+	return batched_paths_added;
 }
 
 /*
@@ -841,14 +906,16 @@ get_join_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	/* We should have found something, else caller passed silly relids */
 	Assert(clauseset.nonempty);
 
-
+	/*
+	 * YB: We collect batched paths first to prioritize them in the path queue.
+	 */
 	if (yb_bnl_batch_size > 1)
-	{
-		yb_get_batched_index_paths(root, rel, index, &clauseset, bitindexpaths);
-	}
+		yb_get_batched_index_paths(root, rel, index,&clauseset,
+											bitindexpaths);
 
 	/* Build index path(s) using the collected set of clauses */
-	get_index_paths(root, rel, index, &clauseset, bitindexpaths);
+	get_index_paths(root, rel, index, &clauseset,
+					NIL /* yb_bitmap_idx_pushdowns */, bitindexpaths);
 
 	/*
 	 * Remember we considered paths for this set of relids.  We use lcons not
@@ -906,6 +973,12 @@ bms_equal_any(Relids relids, List *relids_list)
  * Plain indexpaths are sent directly to add_path, while potential
  * bitmap indexpaths are added to *bitindexpaths for later processing.
  *
+ * YB: Conditions that could be pushed down to the index for this bitmap index
+ * path are appended to yb_bitmap_idx_pushdowns. This function is sometimes
+ * called for individual sub clauses of an OR clause, so it allows us to extract
+ * useful conditions from the subclause without being concerned by the
+ * pushability of the other sub clauses.
+ *
  * This is a fairly simple frontend to build_index_paths().  Its reason for
  * existence is mainly to handle ScalarArrayOpExpr quals properly.  If the
  * index AM supports them natively, we should just include them in simple
@@ -917,7 +990,7 @@ bms_equal_any(Relids relids, List *relids_list)
 static void
 get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 				IndexOptInfo *index, IndexClauseSet *clauses,
-				List **bitindexpaths)
+				List *yb_bitmap_idx_pushdowns, List **bitindexpaths)
 {
 	List	   *indexpaths;
 	bool		skip_nonnative_saop = false;
@@ -932,6 +1005,7 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	 */
 	indexpaths = build_index_paths(root, rel,
 								   index, clauses,
+								   yb_bitmap_idx_pushdowns,
 								   index->predOK,
 								   ST_ANYSCAN,
 								   &skip_nonnative_saop,
@@ -947,6 +1021,7 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 		indexpaths = list_concat(indexpaths,
 								 build_index_paths(root, rel,
 												   index, clauses,
+												   yb_bitmap_idx_pushdowns,
 												   index->predOK,
 												   ST_ANYSCAN,
 												   &skip_nonnative_saop,
@@ -972,7 +1047,8 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 		if (index->amhasgettuple)
 			add_path(rel, (Path *) ipath);
 
-		if (index->amhasgetbitmap &&
+		if (((index->amhasgetbitmap || index->yb_amhasgetbitmap) &&
+			 !IsA(ipath, UpperUniquePath)) &&
 			(ipath->path.pathkeys == NIL ||
 			 ipath->indexselectivity < 1.0))
 			*bitindexpaths = lappend(*bitindexpaths, ipath);
@@ -987,6 +1063,7 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	{
 		indexpaths = build_index_paths(root, rel,
 									   index, clauses,
+									   yb_bitmap_idx_pushdowns,
 									   false,
 									   ST_BITMAPSCAN,
 									   NULL,
@@ -1028,9 +1105,17 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
  * NULL, we do not ignore non-first ScalarArrayOpExpr clauses, but they will
  * result in considering the scan's output to be unordered.
  *
+ * YB: Apart from creating index paths for index predicates, and ordering
+ * usecases, we also also create distinct index scan paths for queries where
+ * the elements are expected to be distinct. Such scans allow us to skip
+ * reading duplicate values, thus fetching fewer rows from the storage layer.
+ *
  * 'rel' is the index's heap relation
  * 'index' is the index for which we want to generate paths
  * 'clauses' is the collection of indexable clauses (RestrictInfo nodes)
+ * 'yb_bitmap_idx_pushdowns' is a set of pushable clauses for a bitmap index scan.
+ *    These are extracted during bitmap planning and allow pushdowns that are
+ *    not possible to determine at a later stage.
  * 'useful_predicate' indicates whether the index has a useful predicate
  * 'scantype' indicates whether we need plain or bitmap scan support
  * 'skip_nonnative_saop' indicates whether to accept SAOP if index AM doesn't
@@ -1039,6 +1124,7 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 static List *
 build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 				  IndexOptInfo *index, IndexClauseSet *clauses,
+				  List *yb_bitmap_idx_pushdowns,
 				  bool useful_predicate,
 				  ScanTypeControl scantype,
 				  bool *skip_nonnative_saop,
@@ -1059,6 +1145,9 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	bool		index_is_ordered;
 	bool		index_only_scan;
 	int			indexcol;
+	bool		yb_supports_distinct_pushdown;
+	int			yb_distinct_prefixlen;
+	int			yb_distinct_nkeys;
 
 	/*
 	 * Check that index supports the desired scan type(s)
@@ -1070,13 +1159,18 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 				return NIL;
 			break;
 		case ST_BITMAPSCAN:
-			if (!index->amhasgetbitmap)
+			if (!index->amhasgetbitmap && !index->yb_amhasgetbitmap)
 				return NIL;
 			break;
 		case ST_ANYSCAN:
 			/* either or both are OK */
 			break;
 	}
+
+	/*
+	 * YB: Avoid generating distinct index scans when not applicable.
+	 */
+	yb_supports_distinct_pushdown = yb_can_pushdown_distinct(root, index);
 
 	/*
 	 * 1. Collect the index clauses into a single list.
@@ -1106,7 +1200,9 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	for (indexcol = 0; indexcol < index->ncolumns; indexcol++)
 	{
 		ListCell   *lc;
+		bool		found_clause;
 
+		found_clause = false;
 		foreach(lc, clauses->indexclauses[indexcol])
 		{
 			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
@@ -1124,7 +1220,16 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 					/* Caller had better intend this only for bitmap scan */
 					Assert(scantype == ST_BITMAPSCAN);
 				}
-				if (indexcol > 0)
+				/*
+				 * YB: No reason to believe lower saop prevents ordering.
+				 * LSM index uses skip based scan, a machinery that also
+				 * enables distinct index scans.
+				 * Moreover, LSM index supports scalar array ops as
+				 * index clauses without sacrificing ordering.
+				 */
+				bool is_yb_index = IsYugaByteEnabled() &&
+					index->relam == LSM_AM_OID;
+				if (!is_yb_index && indexcol > 0)
 				{
 					if (skip_lower_saop)
 					{
@@ -1139,6 +1244,7 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 			clause_columns = lappend_int(clause_columns, indexcol);
 			outer_relids = bms_add_members(outer_relids,
 										   rinfo->clause_relids);
+			found_clause = true;
 		}
 
 		/*
@@ -1151,6 +1257,20 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 		 */
 		if (index_clauses == NIL && !index->amoptionalkey)
 			return NIL;
+
+		/*
+		 * YB: Even though amoptionalkey of YB LSM indexes is true, hash
+		 * columns are not optional in hash partioned indexes as they are
+		 * required to determine the appropriate index partition.
+		 */
+		if (yb_supports_distinct_pushdown && !found_clause &&
+			indexcol < index->nhashcolumns)
+		{
+			index_clauses = NIL;
+			clause_columns = NIL;
+			outer_relids = NULL;
+			break;
+		}
 	}
 
 	/* We do not want the index's rel itself listed in outer_relids */
@@ -1168,16 +1288,67 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	 * if we are only trying to build bitmap indexscans, nor if we have to
 	 * assume the scan is unordered.
 	 */
+
+	/*
+	 * YB: LSM indexes support prefix based scans that can skip duplicate
+	 * values of a prefix entirely. Here, a prefix refers to a contiguous list
+	 * of leading columns on which the index is sorted. Such scans are called
+	 * distinct index scans. These paths scan much fewer rows than the regular
+	 * index scans for DISTINCT operations and thus can be more efficient for
+	 * such purposes.
+	 *
+	 * YB: To generate such a scan,
+	 * First, we compute the minimal prefix that encompasses all the keys
+	 * that need to be distinct. Smaller prefixes lead to more efficient
+	 * scans. However, a prefix that is smaller than necessary may lead to
+	 * inaccurate results. The task here is to compute the right prefix length.
+	 *
+	 * YB: We use the sentinel value -1 to indicate that a distinct index scan
+	 * is not possible/useful.
+	 */
+	if (yb_supports_distinct_pushdown)
+		yb_distinct_prefixlen = yb_calculate_distinct_prefixlen(index,
+																index_clauses);
+	else
+		yb_distinct_prefixlen = -1;
+
 	pathkeys_possibly_useful = (scantype != ST_BITMAPSCAN &&
 								!found_lower_saop_clause &&
 								has_useful_pathkeys(root, rel));
 	index_is_ordered = (index->sortopfamily != NULL);
 	if (index_is_ordered && pathkeys_possibly_useful)
 	{
+		/*
+		 * YB: A distinct index scan may sometimes return duplicate results
+		 * for range partitioned LSM indexes by nature of the underlying
+		 * architecture. This behavior necessitates that we stick a Unique
+		 * node on top of the distinct index scan. However, the distinct index
+		 * scan fetches distinct values of only a prefix of the index key
+		 * columns. Hence, we need the set of the index pathkeys that
+		 * corresponds to this prefix for the Unique node to do its work.
+		 *
+		 * YB: We need this set of pathkeys because ...
+		 * Observe that, in the current architecture, the Unique node
+		 * does not de-duplicate all the columns but only the columns specified
+		 * by the PathKey's. This forces us to fetch the pathkeys corresponding
+		 * to our distinct prefix. Moreover, we only fetch the number of
+		 * pathkeys in 'yb_distinct_nkeys' and not the entire set of pathkeys
+		 * since the resulting set is also a prefix.
+		 *
+		 * Example: SELECT DISTINCT r1, r2 WHERE r1 = r2
+		 * 			yb_distinct_prefixlen = 2 (Scan prefix)
+		 * 			yb_distinct_nkeys = 1 (num pathkeys for distinct).
+		 *
+		 * YB: Currently, yb_distinct_nkeys is required only for a
+		 * range-partitioned index.
+		 */
+		yb_distinct_nkeys = index->nhashcolumns ? -1 : yb_distinct_prefixlen;
 		index_pathkeys = build_index_pathkeys(root, index,
-											  ForwardScanDirection);
+											  ForwardScanDirection,
+											  &yb_distinct_nkeys);
 		useful_pathkeys = truncate_useless_pathkeys(root, rel,
-													index_pathkeys);
+													index_pathkeys,
+													yb_distinct_nkeys);
 		orderbyclauses = NIL;
 		orderbyclausecols = NIL;
 	}
@@ -1197,6 +1368,8 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 		useful_pathkeys = NIL;
 		orderbyclauses = NIL;
 		orderbyclausecols = NIL;
+		/* YB: Only relevant when all requested targets are constant. */
+		yb_distinct_nkeys = 0;
 	}
 
 	/*
@@ -1212,12 +1385,16 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	 * in the current clauses, OR the index ordering is potentially useful for
 	 * later merging or final output ordering, OR the index has a useful
 	 * predicate, OR an index-only scan is possible.
+	 *
+	 * YB: We also generate distinct index paths if there is a valid distinct
+	 * prefix, i.e. 'yb_distinct_prefixlen' >= 0.
 	 */
 	if (index_clauses != NIL || useful_pathkeys != NIL || useful_predicate ||
-		index_only_scan)
+		index_only_scan || yb_distinct_prefixlen >= 0)
 	{
 		ipath = create_index_path(root, index,
 								  index_clauses,
+								  yb_bitmap_idx_pushdowns,
 								  clause_columns,
 								  orderbyclauses,
 								  orderbyclausecols,
@@ -1229,6 +1406,25 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 								  outer_relids,
 								  loop_count,
 								  false);
+
+		/*
+		 * YB: Generate a distinct index path.
+		 * Must be done before generating parallel paths since ipath is reused.
+		 */
+		if (yb_distinct_prefixlen >= 0)
+		{
+			Path *distinct_index_path =
+				yb_create_distinct_index_path(root, index, ipath,
+											  yb_distinct_prefixlen,
+											  yb_distinct_nkeys);
+			result = lappend(result, distinct_index_path);
+		}
+
+		/*
+		 * YB: This append can occur before or after generating the distinct
+		 * index path above. Here, we choose to add the regular path after the
+		 * distinct path since distinct paths are generally cheaper.
+		 */
 		result = lappend(result, ipath);
 
 		/*
@@ -1241,6 +1437,7 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 		{
 			ipath = create_index_path(root, index,
 									  index_clauses,
+									  yb_bitmap_idx_pushdowns,
 									  clause_columns,
 									  orderbyclauses,
 									  orderbyclausecols,
@@ -1269,14 +1466,22 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	 */
 	if (index_is_ordered && pathkeys_possibly_useful)
 	{
+		/*
+		 * YB: Currently, yb_distinct_nkeys is required only for a
+		 * range-partitioned index.
+		 */
+		yb_distinct_nkeys = index->nhashcolumns ? -1 : yb_distinct_prefixlen;
 		index_pathkeys = build_index_pathkeys(root, index,
-											  BackwardScanDirection);
+											  BackwardScanDirection,
+											  &yb_distinct_nkeys);
 		useful_pathkeys = truncate_useless_pathkeys(root, rel,
-													index_pathkeys);
+													index_pathkeys,
+													yb_distinct_nkeys);
 		if (useful_pathkeys != NIL)
 		{
 			ipath = create_index_path(root, index,
 									  index_clauses,
+									  yb_bitmap_idx_pushdowns,
 									  clause_columns,
 									  NIL,
 									  NIL,
@@ -1286,6 +1491,21 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 									  outer_relids,
 									  loop_count,
 									  false);
+
+			/*
+			 * YB: Generate a backwards scanning distinct index path.
+			 * Must be done before generating parallel path since ipath is
+			 * reused.
+			 */
+			if (yb_distinct_prefixlen >= 0)
+			{
+				Path *distinct_index_path =
+					yb_create_distinct_index_path(root, index, ipath,
+												  yb_distinct_prefixlen,
+												  yb_distinct_nkeys);
+				result = lappend(result, distinct_index_path);
+			}
+
 			result = lappend(result, ipath);
 
 			/* If appropriate, consider parallel index scan */
@@ -1295,6 +1515,7 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 			{
 				ipath = create_index_path(root, index,
 										  index_clauses,
+										  yb_bitmap_idx_pushdowns,
 										  clause_columns,
 										  NIL,
 										  NIL,
@@ -1358,11 +1579,12 @@ build_paths_for_OR(PlannerInfo *root, RelOptInfo *rel,
 	{
 		IndexOptInfo *index = (IndexOptInfo *) lfirst(lc);
 		IndexClauseSet clauseset;
+		List	   *yb_bitmap_idx_pushdowns = NIL;
 		List	   *indexpaths;
 		bool		useful_predicate;
 
 		/* Ignore index if it doesn't support bitmap scans */
-		if (!index->amhasgetbitmap)
+		if (!index->amhasgetbitmap && !index->yb_amhasgetbitmap)
 			continue;
 
 		/*
@@ -1401,9 +1623,36 @@ build_paths_for_OR(PlannerInfo *root, RelOptInfo *rel,
 
 		/*
 		 * Identify the restriction clauses that can match the index.
+		 * YB: Since clauses is the set of everything in this particular branch
+		 * of a logical operation, we try to collect pushdown clauses from this
+		 * list because we can't collect them later.
+		 *
+		 * For example, consider the parent clause ((q1 AND q2) OR q3).
+		 *
+		 * If q1 and q2 can be applied to this index, but q3 can't, then the
+		 * full condition ((q1 AND q2) OR q3) can't be pushed down on this
+		 * index. However, in a bitmap scan plan, a particular Bitmap Index Scan
+		 * only needs to be concerned with the quals from its portion of the
+		 * tree.
+		 *
+		 * This function is called recursively for each argument of the OR
+		 * clause and builds an Index Path. At this point, we know exactly what
+		 * conditions the bitmap index path should be concerned with and we can
+		 * choose to push them down. The first bitmap index scan covers the
+		 * (q1 AND q2) condition. In Yugabyte, we can use one as a pushdown
+		 * clause, even if it's not a good index condition.
+		 *
+		 * Because this function operates recursively on subtrees of the
+		 * original condition, it is easy to evaluate one clause of the OR
+		 * separately from the others. Whether or not q3 is pushable for this
+		 * index has no effect on whether q1 or q2 can be pushed down for the
+		 * first bitmap index scan.
 		 */
 		MemSet(&clauseset, 0, sizeof(clauseset));
-		match_clauses_to_index(index, clauses, &clauseset);
+
+		match_clauses_to_index(index, clauses, &clauseset,
+							   index->rel->is_yb_relation
+									? &yb_bitmap_idx_pushdowns : NULL);
 
 		/*
 		 * If no matches so far, and the index predicate isn't useful, we
@@ -1414,14 +1663,18 @@ build_paths_for_OR(PlannerInfo *root, RelOptInfo *rel,
 
 		/*
 		 * Add "other" restriction clauses to the clauseset.
+		 * YB: We do not try to collect pushdown clauses for bitmap index scans
+		 * here because those will be gathered from all clauses by
+		 * create_indexscan_plan.
 		 */
-		match_clauses_to_index(index, other_clauses, &clauseset);
+		match_clauses_to_index(index, other_clauses, &clauseset, NULL);
 
 		/*
 		 * Construct paths if possible.
 		 */
 		indexpaths = build_index_paths(root, rel,
 									   index, &clauseset,
+									   yb_bitmap_idx_pushdowns,
 									   useful_predicate,
 									   ST_BITMAPSCAN,
 									   NULL,
@@ -1629,6 +1882,10 @@ choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel, List *paths)
 	{
 		Path	   *ipath = (Path *) lfirst(l);
 
+		/* TODO(#21039): Support Distinct Bitmap Scans */
+		if (IsA(ipath, UpperUniquePath))
+			continue;
+
 		pathinfo = classify_index_clause_usage(ipath, &clauselist);
 
 		/* If it's unclassifiable, treat it as distinct from all others */
@@ -1690,7 +1947,11 @@ choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel, List *paths)
 
 		pathinfo = pathinfoarray[i];
 		paths = list_make1(pathinfo->path);
-		costsofar = bitmap_scan_cost_est(root, rel, pathinfo->path);
+		if (rel->is_yb_relation)
+			costsofar = yb_bitmap_scan_cost_est(root, rel, pathinfo->path);
+		else
+			costsofar = bitmap_scan_cost_est(root, rel, pathinfo->path);
+
 		qualsofar = list_concat(list_copy(pathinfo->quals),
 								list_copy(pathinfo->preds));
 		clauseidsofar = bms_copy(pathinfo->clauseids);
@@ -1826,6 +2087,40 @@ bitmap_scan_cost_est(PlannerInfo *root, RelOptInfo *rel, Path *ipath)
 }
 
 /*
+ * Estimate the cost of actually executing a YB bitmap scan with a single
+ * index path (which could be a BitmapAnd or BitmapOr node).
+ */
+static Cost
+yb_bitmap_scan_cost_est(PlannerInfo *root, RelOptInfo *rel, Path *ipath)
+{
+	YbBitmapTablePath bpath;
+
+	/* Set up a dummy YbBitmapTablePath */
+	bpath.path.type = T_YbBitmapTablePath;
+	bpath.path.pathtype = T_YbBitmapTableScan;
+	bpath.path.parent = rel;
+	bpath.path.pathtarget = rel->reltarget;
+	bpath.path.param_info = ipath->param_info;
+	bpath.path.pathkeys = NIL;
+	bpath.bitmapqual = ipath;
+
+	/*
+	 * Check the cost of temporary path without considering parallelism.
+	 * Parallel bitmap heap path will be considered at later stage.
+	 */
+	bpath.path.parallel_workers = 0;
+
+	/* Now we can do cost_yb_bitmap_table_scan */
+	cost_yb_bitmap_table_scan(&bpath.path, root, rel,
+							  bpath.path.param_info,
+							  ipath,
+							  get_loop_count(root, rel->relid,
+											 PATH_REQ_OUTER(ipath)));
+
+	return bpath.path.total_cost;
+}
+
+/*
  * Estimate the cost of actually executing a BitmapAnd scan with the given
  * inputs.
  */
@@ -1840,7 +2135,10 @@ bitmap_and_cost_est(PlannerInfo *root, RelOptInfo *rel, List *paths)
 	 */
 	apath = create_bitmap_and_path(root, rel, paths);
 
-	return bitmap_scan_cost_est(root, rel, (Path *) apath);
+	if (rel->is_yb_relation)
+		return yb_bitmap_scan_cost_est(root, rel, (Path *) apath);
+	else
+		return bitmap_scan_cost_est(root, rel, (Path *) apath);
 }
 
 
@@ -2105,7 +2403,7 @@ check_index_only(RelOptInfo *rel, IndexOptInfo *index)
  * estimates before it begins to compute paths, or at least before it
  * calls create_index_paths().
  */
-static double
+double
 get_loop_count(PlannerInfo *root, Index cur_relid, Relids outer_relids)
 {
 	double		result;
@@ -2147,6 +2445,11 @@ get_loop_count(PlannerInfo *root, Index cur_relid, Relids outer_relids)
 		if (result == 0.0 || result > rowcount)
 			result = rowcount;
 	}
+
+	if (!bms_is_empty(root->yb_cur_batched_relids) &&
+		 yb_enable_base_scans_cost_model)
+		result /= yb_bnl_batch_size;
+
 	/* Return 1.0 if we found no valid relations (shouldn't happen) */
 	return (result > 0.0) ? result : 1.0;
 }
@@ -2248,7 +2551,8 @@ match_restriction_clauses_to_index(RelOptInfo *rel, IndexOptInfo *index,
 								   IndexClauseSet *clauseset)
 {
 	/* We can ignore clauses that are implied by the index predicate */
-	match_clauses_to_index(index, index->indrestrictinfo, clauseset);
+	match_clauses_to_index(index, index->indrestrictinfo, clauseset,
+						   NULL /* yb_bitmap_idx_pushdowns */);
 }
 
 /*
@@ -2278,7 +2582,8 @@ match_join_clauses_to_index(PlannerInfo *root,
 		if (restriction_is_or_clause(rinfo))
 			*joinorclauses = lappend(*joinorclauses, rinfo);
 		else
-			match_clause_to_index(index, rinfo, clauseset);
+			match_clause_to_index(index, rinfo, clauseset,
+								  NULL /* yb_bitmap_idx_pushdowns */);
 	}
 }
 
@@ -2316,7 +2621,8 @@ match_eclass_clauses_to_index(PlannerInfo *root, IndexOptInfo *index,
 		 * since for non-btree indexes the EC's equality operators might not
 		 * be in the index opclass (cf ec_member_matches_indexcol).
 		 */
-		match_clauses_to_index(index, clauses, clauseset);
+		match_clauses_to_index(index, clauses, clauseset,
+							   NULL /* yb_bitmap_idx_pushdowns */);
 	}
 }
 
@@ -2328,7 +2634,8 @@ match_eclass_clauses_to_index(PlannerInfo *root, IndexOptInfo *index,
 static void
 match_clauses_to_index(IndexOptInfo *index,
 					   List *clauses,
-					   IndexClauseSet *clauseset)
+					   IndexClauseSet *clauseset,
+					   List **yb_bitmap_idx_pushdowns)
 {
 	ListCell   *lc;
 
@@ -2336,7 +2643,8 @@ match_clauses_to_index(IndexOptInfo *index,
 	{
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
 
-		match_clause_to_index(index, rinfo, clauseset);
+		match_clause_to_index(index, rinfo, clauseset,
+							  yb_bitmap_idx_pushdowns);
 	}
 }
 
@@ -2359,9 +2667,11 @@ match_clauses_to_index(IndexOptInfo *index,
 static void
 match_clause_to_index(IndexOptInfo *index,
 					  RestrictInfo *rinfo,
-					  IndexClauseSet *clauseset)
+					  IndexClauseSet *clauseset,
+					  List **yb_bitmap_idx_pushdowns)
 {
 	int			indexcol;
+	List	   *colrefs = NIL;
 
 	/*
 	 * Never match pseudoconstants to indexes.  (Normally a match could not
@@ -2393,12 +2703,72 @@ match_clause_to_index(IndexOptInfo *index,
 			return;
 		}
 	}
+
+	/*
+	 * If the restrict info cannot be directly applied to an index col, check if
+	 * it could be pushed down as a remote index filter.
+	 */
+	if (IsYugaByteEnabled() && yb_bitmap_idx_pushdowns &&
+			YbCanPushdownExpr(rinfo->clause, &colrefs) &&
+			is_index_only_refs(colrefs, index, true /* bitmapindex */)) {
+		rinfo->yb_pushable = true;
+		*yb_bitmap_idx_pushdowns = lappend(*yb_bitmap_idx_pushdowns, rinfo);
+	}
 }
 
 static bool is_yb_hash_code_call(Node *clause)
 {
 	return clause && IsA(clause, FuncExpr)
 				&& (((FuncExpr *) clause)->funcid == YB_HASH_CODE_OID);
+}
+
+
+/*
+ * yb_hash_code_call_matches_indexcol
+ * 	  Returns true if the index is on yb_hash_code(a, b, ...) and this index column is
+ *	  a matching yb_hash_code(a, b, ...) clause.
+ */
+static bool
+yb_hash_code_call_matches_indexcol(Node *yb_hash_code_clause,
+								   IndexOptInfo *index,
+								   int indexcol)
+{
+	if (!index->indexprs)
+		return false;
+	int			pos;
+	ListCell   *indexpr_item;
+
+	/* Iterate over each column of the index until the column of interest. */
+	indexpr_item = list_head(index->indexprs);
+	for (pos = 0; pos <= indexcol; pos++)
+	{
+		if (index->indexkeys[pos] == 0)
+		{
+			/* The index column refers to the next expression of indexprs. */
+			Node	   *indexkey;
+
+			if (indexpr_item == NULL)
+			{
+				elog(WARNING, "too few entries in indexprs list");
+				return false;
+			}
+
+			if (pos == indexcol)
+			{
+				indexkey = (Node *) lfirst(indexpr_item);
+				if (indexkey && IsA(indexkey, RelabelType))
+						indexkey = (Node *) ((RelabelType *) indexkey)->arg;
+				if (equal(yb_hash_code_clause, indexkey))
+				{
+					return true;
+				}
+			}
+
+			indexpr_item = lnext(indexpr_item);
+		}
+	}
+
+	return false;
 }
 
 /*
@@ -2538,8 +2908,8 @@ match_clause_to_indexcol(IndexOptInfo *index,
 		if (!nt->argisrow &&
 			match_index_to_operand((Node *) nt->arg, indexcol, index)) {
 				/* Cannot push down IS NOT NULL on hash columns in LSM Index */
-				if (IsYBRelationById(index->indexoid) && 
-				    nt->nulltesttype == IS_NOT_NULL && 
+				if (IsYBRelationById(index->indexoid) &&
+				    nt->nulltesttype == IS_NOT_NULL &&
 					is_hash_column_in_lsm_index(index, indexcol))
 					return false;
 				return true;
@@ -2557,14 +2927,20 @@ match_clause_to_indexcol(IndexOptInfo *index,
 		!bms_is_member(index_relid, right_relids) &&
 		!contain_volatile_functions(rightop))
 	{
-		if (is_yb_hash_code_call(leftop)) {
-				return is_indexable_operator(expr_op,
-							INTEGER_LSM_FAM_OID, true)
-						&& is_opclause(clause);
+		/*
+		 * Do not use the yb_hash_code special case if we have an applicable
+		 * functional index on yb_hash_code. For example, if the call is an
+		 * index on yb_hash_code(x, y) and the clause is yb_hash_code(x, y),
+		 * we will take the typical index path.
+		 */
+		if (is_yb_hash_code_call(leftop) &&
+			!yb_hash_code_call_matches_indexcol(leftop, index, indexcol)) {
+			return is_indexable_operator(expr_op, INTEGER_LSM_FAM_OID, true)
+				&& is_opclause(clause);
 		}
 
 		/*
-		 * If the column in the filter clause is part of the hash key for this 
+		 * If the column in the filter clause is part of the hash key for this
 		 * index and the clause uses an inequality operator, then index scan
 		 * cannot be used. This is because a hash index is sorted by the hash
 		 * value and not by the value of the column. #13241
@@ -2596,14 +2972,20 @@ match_clause_to_indexcol(IndexOptInfo *index,
 		!bms_is_member(index_relid, left_relids) &&
 		!contain_volatile_functions(leftop))
 	{
-		if (is_yb_hash_code_call(rightop)) {
-				return is_indexable_operator(expr_op,
-							INTEGER_LSM_FAM_OID, true)
-						&& is_opclause(clause);
+		/*
+		 * Do not use the yb_hash_code special case if we have an applicable
+		 * functional index on yb_hash_code. For example, if the call is an
+		 * index on yb_hash_code(x, y) and the clause is yb_hash_code(x, y),
+		 * we will take the typical index path.
+		 */
+		if (is_yb_hash_code_call(rightop) &&
+			!yb_hash_code_call_matches_indexcol(rightop, index, indexcol)) {
+			return is_indexable_operator(expr_op, INTEGER_LSM_FAM_OID, false)
+				&& is_opclause(clause);
 		}
 
 		/*
-		 * If the column in the filter clause is part of the hash key for this 
+		 * If the column in the filter clause is part of the hash key for this
 		 * index and the clause uses an inequality operator, then index scan
 		 * cannot be used. This is because a hash index is sorted by the hash
 		 * value and not by the value of the column. #13241
@@ -2691,7 +3073,7 @@ match_rowcompare_to_indexcol(IndexOptInfo *index,
 	 * operators are matchable to the index.
 	 */
 	leftop = (Node *) linitial(clause->largs);
-	rightop = (Node *) linitial(clause->rargs);
+	rightop = (Node *) linitial(castNode(List, clause->rargs));
 	expr_op = linitial_oid(clause->opnos);
 	expr_coll = linitial_oid(clause->inputcollids);
 
@@ -3496,7 +3878,7 @@ match_index_to_operand(Node *operand,
 		/*
 		 * Simple index column; operand must be a matching Var
 		 */
-		
+
 		Var *operand_var = NULL;
 		if (operand && IsA(operand, Var))
 			operand_var = (Var *) operand;
@@ -4158,8 +4540,9 @@ adjust_rowcompare_for_index(RowCompareExpr *clause,
 	var_on_left = match_index_to_operand((Node *) linitial(clause->largs),
 										 indexcol, index);
 	Assert(var_on_left ||
-		   match_index_to_operand((Node *) linitial(clause->rargs),
-								  indexcol, index));
+		   match_index_to_operand(
+				(Node *) linitial(castNode(List, clause->rargs)),
+				indexcol, index));
 	*var_on_left_p = var_on_left;
 
 	expr_op = linitial_oid(clause->opnos);
@@ -4185,8 +4568,10 @@ adjust_rowcompare_for_index(RowCompareExpr *clause,
 	 * indexed relation.
 	 */
 	matching_cols = 1;
+	bool yb_is_row_array_cmp = clause->rctype == ROWCOMPARE_EQ;
 	largs_cell = lnext(list_head(clause->largs));
-	rargs_cell = lnext(list_head(clause->rargs));
+	rargs_cell = yb_is_row_array_cmp ? NULL :
+		lnext(list_head(castNode(List, clause->rargs)));
 	opnos_cell = lnext(list_head(clause->opnos));
 	collids_cell = lnext(list_head(clause->inputcollids));
 
@@ -4200,10 +4585,12 @@ adjust_rowcompare_for_index(RowCompareExpr *clause,
 		if (var_on_left)
 		{
 			varop = (Node *) lfirst(largs_cell);
-			constop = (Node *) lfirst(rargs_cell);
+			constop = (Node *) yb_is_row_array_cmp ? clause->rargs :
+				lfirst(rargs_cell);
 		}
 		else
 		{
+			Assert(!yb_is_row_array_cmp);
 			varop = (Node *) lfirst(rargs_cell);
 			constop = (Node *) lfirst(largs_cell);
 			/* indexkey is on right, so commute the operator */
@@ -4211,9 +4598,10 @@ adjust_rowcompare_for_index(RowCompareExpr *clause,
 			if (expr_op == InvalidOid)
 				break;			/* operator is not usable */
 		}
-		if (bms_is_member(index->rel->relid, pull_varnos(constop)))
+		if (!yb_is_row_array_cmp &&
+			bms_is_member(index->rel->relid, pull_varnos(constop)))
 			break;				/* no good, Var on wrong side */
-		if (contain_volatile_functions(constop))
+		if (!yb_is_row_array_cmp && contain_volatile_functions(constop))
 			break;				/* no good, volatile comparison value */
 
 		/*
@@ -4247,7 +4635,8 @@ adjust_rowcompare_for_index(RowCompareExpr *clause,
 		/* This column matches, keep scanning */
 		matching_cols++;
 		largs_cell = lnext(largs_cell);
-		rargs_cell = lnext(rargs_cell);
+		if (!yb_is_row_array_cmp)
+			rargs_cell = lnext(rargs_cell);
 		opnos_cell = lnext(opnos_cell);
 		collids_cell = lnext(collids_cell);
 	}
@@ -4321,17 +4710,19 @@ adjust_rowcompare_for_index(RowCompareExpr *clause,
 									   matching_cols);
 		rc->inputcollids = list_truncate(list_copy(clause->inputcollids),
 										 matching_cols);
-		rc->largs = list_truncate(copyObject(clause->largs),
+		rc->largs = list_truncate(copyObject(castNode(List,clause->largs)),
 								  matching_cols);
-		rc->rargs = list_truncate(copyObject(clause->rargs),
-								  matching_cols);
+		rc->rargs = (Node *)
+			list_truncate(copyObject(castNode(List, clause->rargs)),
+									 matching_cols);
 		return (Expr *) rc;
 	}
 	else
 	{
 		return make_opclause(linitial_oid(new_ops), BOOLOID, false,
 							 copyObject(linitial(clause->largs)),
-							 copyObject(linitial(clause->rargs)),
+							 copyObject(
+								linitial(castNode(List, clause->rargs))),
 							 InvalidOid,
 							 linitial_oid(clause->inputcollids));
 	}
@@ -4620,8 +5011,78 @@ string_to_const(const char *str, Oid datatype)
 					 conval, false, false);
 }
 
-static bool 
-is_hash_column_in_lsm_index(const IndexOptInfo* index, int columnIndex) 
+static bool
+is_hash_column_in_lsm_index(const IndexOptInfo* index, int columnIndex)
 {
 	return (index->relam == LSM_AM_OID && columnIndex < index->nhashcolumns);
+}
+
+/*
+ * YB: yb_can_pushdown_distinct
+ *
+ * Check if distinct index scan is appropriate for the given relation/index.
+ *
+ * Cannot pushdown distinct if:
+ * - distinct pushdown is disabled by the user
+ * - there is no distinct clause
+ * - index is not YB LSM
+ * - distinct clause does not support distinct pushdown
+ * - any of the relevant join clauses do not support distinct pushdown
+ * - any of the implied join equalities do not support distinct pushdown
+ *
+ * See yb_reject_distinct_pushdown to understand when pushdown is
+ * not supported by clauses/expressions.
+ */
+static bool
+yb_can_pushdown_distinct(PlannerInfo *root, IndexOptInfo *index)
+{
+	Relids	  otherrels;
+	List	 *joininfo;
+	List	 *clause_list;
+	ListCell *lc;
+
+	/*
+	 * Computing the correct relids sets is tricky.
+	 * See check_index_predicates for details.
+	 */
+	if (index->rel->reloptkind == RELOPT_OTHER_MEMBER_REL)
+		otherrels = bms_difference(root->all_baserels,
+								   find_childrel_parents(
+										root, index->rel));
+	else
+		otherrels = bms_difference(root->all_baserels, index->rel->relids);
+
+	/* Collect join clauses and implied join clauses. */
+	joininfo = list_concat(
+		list_copy(index->rel->joininfo),
+		generate_join_implied_equalities(
+			root,
+			bms_union(index->rel->relids, otherrels),
+			otherrels,
+			index->rel));
+
+	clause_list = NIL;
+	foreach(lc, joininfo)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+		clause_list = lappend(clause_list, rinfo->clause);
+	}
+
+	/*
+	 * We use root->parse->distinctClause and not root->distinct_pathkeys
+	 * because root->distinct_pathkeys can be NULL even for DISTINCT queries.
+	 * This happens when all the requested columns are constant.
+	 */
+	return
+		IsYugaByteEnabled() &&
+		yb_enable_distinct_pushdown &&
+		root->parse->distinctClause != NIL &&
+		index->relam == LSM_AM_OID &&
+		!root->parse->hasAggs &&
+		!root->parse->hasWindowFuncs &&
+		!root->parse->hasTargetSRFs &&
+		!yb_reject_distinct_pushdown((Node *)
+			get_sortgrouplist_exprs(root->parse->distinctClause,
+									root->processed_tlist)) &&
+		!yb_reject_distinct_pushdown((Node *) clause_list);
 }

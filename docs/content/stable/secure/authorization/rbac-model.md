@@ -4,7 +4,6 @@ linkTitle: Overview
 headerTitle: Role-based access overview
 description: Overview of the role-based access control (RBAC) model in YSQL.
 headcontent: How role-based access control works
-image: /images/section_icons/secure/rbac-model.png
 menu:
   stable:
     identifier: rbac-model
@@ -66,7 +65,7 @@ The following table describes the default YSQL roles and users in YugabyteDB clu
 | :--- | :---------- |
 | postgres | Superuser role created during database creation. |
 | yb_extension | Role that allows non-superuser users to create PostgreSQL extensions. |
-| yb_fdw | Role that allows non-superuser users to [CREATE](../../../api/ysql/the-sql-language/statements/ddl_create_foreign_data_wrapper/), [ALTER](../../../api/ysql/the-sql-language/statements/ddl_alter_foreign_data_wrapper/), and [DROP](../../../api/ysql/the-sql-language/statements/ddl_drop_foreign_data_wrapper/) [foreign data wrappers](../../../explore/ysql-language-features/foreign-data-wrappers/). |
+| yb_fdw | Role that allows non-superuser users to [CREATE](../../../api/ysql/the-sql-language/statements/ddl_create_foreign_data_wrapper/), [ALTER](../../../api/ysql/the-sql-language/statements/ddl_alter_foreign_data_wrapper/), and [DROP](../../../api/ysql/the-sql-language/statements/ddl_drop_foreign_data_wrapper/) [foreign data wrappers](../../../explore/ysql-language-features/advanced-features/foreign-data-wrappers/). |
 | yugabyte | Superuser role used during database creation, by Yugabyte support to perform maintenance operations, and for backups (using ysql_dump). |
 
 ### yb_extension

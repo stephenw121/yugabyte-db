@@ -3,18 +3,16 @@
 package com.yugabyte.yw.commissioner;
 
 import com.yugabyte.yw.common.PlatformServiceException;
-import com.yugabyte.yw.common.YbcBackupUtil;
+import com.yugabyte.yw.common.backuprestore.ybc.YbcBackupUtil;
 import com.yugabyte.yw.common.services.YbcClientService;
 import com.yugabyte.yw.forms.UniverseTaskParams;
 import java.time.Duration;
 import java.util.concurrent.CancellationException;
-
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import org.yb.client.YbcClient;
 import org.yb.ybc.BackupServiceTaskProgressRequest;
 import org.yb.ybc.BackupServiceTaskProgressResponse;
-import org.yb.ybc.BackupServiceTaskStage;
 import org.yb.ybc.ControllerStatus;
 
 @Slf4j
@@ -24,7 +22,7 @@ public abstract class YbcTaskBase extends AbstractTaskBase {
   public final YbcBackupUtil ybcBackupUtil;
 
   // Time to wait (in millisec) between each poll to ybc.
-  private static final int WAIT_EACH_ATTEMPT_MS = 15000;
+  private final int WAIT_EACH_ATTEMPT_MS = 15000;
 
   @Inject
   public YbcTaskBase(
@@ -54,14 +52,11 @@ public abstract class YbcTaskBase extends AbstractTaskBase {
         throw new RuntimeException(
             String.format("%s %s", baseLogMessage, "Got error checking progress on YB-Controller"));
       }
-      if (backupServiceTaskProgressResponse.getTaskStatus().equals(ControllerStatus.NOT_FOUND)) {
-        throw new RuntimeException(
-            String.format("%s %s", baseLogMessage, "Task not found on YB-Controller"));
-      }
       log.info(
           "{} Number of retries {}",
           baseLogMessage,
           backupServiceTaskProgressResponse.getRetryCount());
+
       switch (backupServiceTaskProgressResponse.getStage()) {
         case UPLOAD:
         case DOWNLOAD:
@@ -90,7 +85,10 @@ public abstract class YbcTaskBase extends AbstractTaskBase {
         return;
       case ABORT:
         log.info(String.format("%s Task aborted on YB-Controller.", baseLogMessage));
-        throw new CancellationException("Yb-Controller task aborted.");
+        throw new CancellationException("Task aborted on YB-Controller.");
+      case NOT_FOUND:
+        throw new RuntimeException(
+            String.format("%s %s", baseLogMessage, "Task not found on YB-Controller"));
       default:
         throw new PlatformServiceException(
             taskStatus.getNumber(),

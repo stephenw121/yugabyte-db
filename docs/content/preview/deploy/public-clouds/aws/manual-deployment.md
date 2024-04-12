@@ -1,8 +1,8 @@
 ---
-title: Manually deploy on Amazon Web Services
+title: Manual deployment on Amazon Web Services (AWS)
 headerTitle: Amazon Web Services
 linkTitle: Amazon Web Services
-description: Manually deploy a YugabyteDB cluster on Amazon Web Services.
+description: How to manually deploy a YugabyteDB cluster on Amazon Web Services (AWS)
 menu:
   preview:
     identifier: deploy-in-aws-3-manual-deployment
@@ -32,7 +32,7 @@ type: docs
   </li>
 </ul>
 
-This page documents the manual deployment of YugabyteDB on six AWS EC2 instances with `c5d.4xlarge` as the instance type and CentOS 7 as the instance operating system. The deployment is configured for multiple availability zones (multi-AZ), with three AZs, and has a replication factor (RF) of `3`. The configuration can be changed to handle single-AZ as well as multi-region deployments.
+This page documents the manual deployment of YugabyteDB on six AWS EC2 instances with `c5d.4xlarge` as the instance type and CentOS 7 as the instance operating system. The deployment is configured for multiple availability zones (multi-AZ), with three AZs, and has a replication factor (RF) of 3. The configuration can be changed to handle single-AZ as well as multi-region deployments.
 
 ## 1. Prerequisites
 
@@ -64,7 +64,7 @@ export AZ2_NODES="<ip2> <ip2> ..."
 export AZ3_NODES="<ip1> <ip2> ..."
 
 # Version of YugabyteDB you plan to install.
-export YB_VERSION=2.3.3.0
+export YB_VERSION={{<yb-version version="preview" format="version">}}
 
 # Comma separated list of directories available for YB on each node
 # In this example, it is just 1. But if you have two then the RHS
@@ -576,7 +576,7 @@ $ curl -s http://<any-master-ip>:7000/cluster-config
 
 And confirm that the output looks similar to what is shown below with `min_num_replicas` set to 1 for each AZ.
 
-```json
+```yaml
 replication_info {
   live_replicas {
     num_replicas: 3

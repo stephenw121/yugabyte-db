@@ -16,12 +16,26 @@
     mount_cores_dir: "{{ _mount_points[0] }}/cores"
   tags: always
 
+- set_fact:
+    systemd_unit_dir: "/usr/lib/systemd/system"
+  when: ansible_os_family == "Suse"
+  tags: always
+
 - name: Configure | Add yb server ctl script
   vars:
     mount_paths: "{{ _mount_points | join(' ') }}"
   template:
     src: yb-server-ctl.sh.j2
     dest: "{{ yb_bin_dir }}/yb-server-ctl.sh"
+    owner: "{{ user_name }}"
+    mode: 0755
+
+- name: Configure | Add clock sync script
+  vars:
+    mount_paths: "{{ _mount_points | join(' ') }}"
+  template:
+    src: clock-sync.sh.j2
+    dest: "{{ yb_bin_dir }}/clock-sync.sh"
     owner: "{{ user_name }}"
     mode: 0755
 
@@ -83,8 +97,8 @@
 
   - name: Setup cron to cleanup core files.
     cron:
-      name: "cleanup core files hourly"
-      minute: "0"
+      name: "cleanup core files every 5 minutes"
+      minute: "*/5"
       user: "{{ user_name }}"
       job: "{{ yb_bin_dir }}/clean_cores.sh"
     register: cron_result
@@ -94,8 +108,8 @@
 
   - name: Setup cron to cleanup log files.
     cron:
-      name: "cleanup yb log files hourly"
-      minute: "5"
+      name: "cleanup yb log files every 5 minutes"
+      minute: "*/5"
       user: "{{ user_name }}"
       job: "{{ yb_bin_dir }}/zip_purge_yb_logs.sh"
     register: cron_result
@@ -122,13 +136,13 @@
   # Remove old cron jobs that clean cores, purge logs and collect metrics
   - name: Remove old cron job that cleans cores (for upgrades)
     cron:
-      name: "cleanup core files hourly"
+      name: "cleanup core files every 5 minutes"
       user: "{{ user_name }}"
       state: absent
 
   - name: Remove old cron job that purges logs (for upgrades)
     cron:
-      name: "cleanup yb log files hourly"
+      name: "cleanup yb log files every 5 minutes"
       user: "{{ user_name }}"
       state: absent
 
@@ -140,8 +154,8 @@
 
   - name: Determine system or user scope
     stat:
-      path: /etc/systemd/system/yb-zip_purge_yb_logs.service
-    register: systemd_system
+      path: "{{ yb_home_dir | default('/home/yugabyte') }}/.config/systemd/user/yb-zip_purge_yb_logs.service"
+    register: user_systemd
 
   - name: Systemd user units
     block:
@@ -190,7 +204,7 @@
     # Necessary for yb-master/tserver to be accessible. 'After' in service file.
     - name: Link network-online.target
       shell:
-        cmd: "systemctl --user link /lib/systemd/system/network-online.target"
+        cmd: "systemctl --user link {{ systemd_unit_dir }}/network-online.target"
 
     - name: Start network-online.target
       systemd:
@@ -199,7 +213,7 @@
         enabled: yes
         scope: user
         daemon_reload: yes
-    when: not systemd_system.stat.exists
+    when: user_systemd.stat.exists
 
   - name: Systemd system units
     block:
@@ -246,7 +260,7 @@
     - name: Run collect_metrics_wrapper.sh (using timer) for collecting metrics
       shell:
         cmd: "sudo systemctl start yb-collect_metrics.timer"
-    when: systemd_system.stat.exists
+    when: not user_systemd.stat.exists
 
   tags: systemd_upgrade
   when: systemd_option

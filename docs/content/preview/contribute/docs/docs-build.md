@@ -3,7 +3,6 @@ title: Build the YugabyteDB docs locally
 headerTitle: Build the docs
 linkTitle: Build the docs
 description: Build the YugabyteDB docs locally
-image: /images/section_icons/index/quick_start.png
 menu:
   preview:
     identifier: docs-build
@@ -26,16 +25,19 @@ To run the docs site locally and edit the docs, you'll need:
 
     Xcode is many gigabytes. Install the command-line tools unless you actually need the full Xcode.
 
+* [**Node.js**](https://nodejs.org/en/download/) LTS (16) using [NVM](https://github.com/nvm-sh/nvm?tab=readme-ov-file#install--update-script) : `nvm install 16.14.0`
+
+  <!-- * Using Homebrew: `brew install node@16` -->
+
 * [**Homebrew**](https://brew.sh) on macOS or Linux.
-
-* **[Node.js](https://nodejs.org/en/download/)** LTS (16) or current (18):
-
-  * Using Homebrew: `brew install node` for current, or `brew install node@16` for LTS
-  * Using NVM: `nvm install 18` for current, or `nvm install --lts` for LTS
 
 * **Hugo**: `brew install hugo` installs the latest version.
 
 * **Go**: `brew install go` installs the latest version.
+
+* **Python** (version 3.10 or earlier): You need `python` to be available somewhere in your shell path.
+
+    Recent versions of macOS have only a `python3` executable, as does the Homebrew install. You can use [pyenv](https://github.com/pyenv/pyenv) to manage multiple versions of python on your system. Make sure to point to Python version 3.10 or earlier.
 
 * **A GitHub account**.
 
@@ -55,7 +57,7 @@ Create the folder with `mkdir ~/.hugo-cache`, then start a new terminal session.
 
 ## Fork the repository
 
-1. To make the commands in this section work correctly when you paste them, set an environment variable to store your GitHub username. (Replace `your-github-id` here with your own GitHub ID.)
+1. To make the commands in this section work correctly when you paste them, set an environment variable to store your GitHub username. (Replace `your-github-id` in the following command with your own GitHub ID.)
 
     ```sh
     export GITHUB_ID=your-github-id
@@ -80,10 +82,12 @@ Create the folder with `mkdir ~/.hugo-cache`, then start a new terminal session.
 1. Make sure that your local repository is still current with the upstream Yugabyte repository:
 
     ```sh
+    cd docs/
     git checkout master
     git pull upstream master
-    git push origin
     ```
+
+Refer to [Edit an existing page](../docs-edit/#edit-an-existing-page) to create a new branch, commit your changes, and create a pull request.
 
 ## Build the docs site {#live-reload}
 
@@ -94,13 +98,24 @@ To get the docs site running in a live-reload server on your local machine, run 
 ```sh
 cd yugabyte-db/docs  # Make sure this is YOUR fork.
 npm ci               # Only necessary the first time you clone the repo.
+hugo mod get -u      # Installs Hugo as a dependency of the site.
 hugo mod clean       # Only necessary the first time you clone the repo.
-npm start            # Build the docs and launch the live-reload server.
+npm start            # Do this every time to build the docs and launch the live-reload server.
 ```
 
 The live-reload server runs at <http://localhost:1313/> unless port 1313 is already in use. Check the output from the `npm start` command to verify the port.
 
 When you're done, type Ctrl-C stop the server.
+
+### Optional: Run builds more quickly
+
+If you are only working in `preview` or `stable`, you can start the live-reload server more quickly using the following:
+
+```sh
+npm run fast
+```
+
+This builds only the `preview` and `stable` directories, and does not generate syntax diagrams.
 
 ### Optional: Run a full build {#full-build}
 
@@ -121,8 +136,9 @@ When the build is done, the `yugabyte-db/docs/public` folder contains a full HTM
 
 * If the live-reload server (`npm start`) is returning a Hugo error &mdash; say, about shortcodes &mdash; re-run `hugo mod clean`, followed by `npm start`. Also, be sure you've followed the instructions on this page to [configure Hugo](#configure-hugo).
 
-<!-- I think Docsy fixed this one! -->
-<!-- * If the live-reload site looks odd, stop the server with Ctrl-C and re-run `npm start`. -->
+* Make sure your tools are up-to-date. Run `brew update` periodically, and if it reports anything out of date, run `brew upgrade`.
+
+* If you get an error about missing modules, try running `npm install`.
 
 ## Next steps
 

@@ -64,9 +64,9 @@ hostssl mydb myuser myhost cert,hostssl all all all reject
 To begin, download and configure sample certificates:
 
 ```sh
-$ wget https://raw.githubusercontent.com/yugabyte/yugabyte-db/master/ent/test_certs/ca.crt
-$ wget -O node.127.0.0.1.key https://raw.githubusercontent.com/yugabyte/yugabyte-db/master/ent/test_certs/ysql.key
-$ wget -O node.127.0.0.1.crt https://raw.githubusercontent.com/yugabyte/yugabyte-db/master/ent/test_certs/ysql.crt
+$ wget https://raw.githubusercontent.com/yugabyte/yugabyte-db/master/test_certs/ca.crt
+$ wget -O node.127.0.0.1.key https://raw.githubusercontent.com/yugabyte/yugabyte-db/master/test_certs/ysql.key
+$ wget -O node.127.0.0.1.crt https://raw.githubusercontent.com/yugabyte/yugabyte-db/master/test_certs/ysql.crt
 $ chmod 600 ca.crt node.127.0.0.1.key node.127.0.0.1.crt
 $ CERTS=`pwd`
 $ ENABLE_TLS="use_client_to_server_encryption=true,certs_for_client_dir=$CERTS"
@@ -106,7 +106,7 @@ SSL connection (protocol: TLSv1.2, cipher: ECDHE-RSA-AES256-GCM-SHA384, bits: 25
 Type "help" for help.
 ```
 
-The default `ysqlsh` SSL mode is `prefer` (see <https://www.postgresql.org/docs/11/libpq-ssl.html>), which tries SSL first, but falls back to no-ssl if the server does not support it.
+The default `ysqlsh` SSL mode is `prefer` (refer to [SSL Support](https://www.postgresql.org/docs/11/libpq-ssl.html) in the PostgreSQL documentation), which tries SSL first, but falls back to `disable` if the server does not support it.
 
 In this case, a plain `ysqlsh` with no options will work and use encryption:
 

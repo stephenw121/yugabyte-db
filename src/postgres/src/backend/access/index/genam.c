@@ -128,10 +128,22 @@ RelationGetIndexScan(Relation indexRelation, int nkeys, int norderbys)
 	scan->xs_cbuf = InvalidBuffer;
 	scan->xs_continue_hot = false;
 
+	/*
+	 * TODO(jason): for PG 15, xs_ctup.t_self (xs_heaptid there) is not made
+	 * invalid since commit c2fe139c201c48f1133e9fbea2dd99b8efe2fadd.  Not sure
+	 * why that was removed (might have been a mistake), so it is probably
+	 * worth bringing that back for the sake of YB asserts that that PG field
+	 * is not changed in YB logic.
+	 */
+	scan->xs_ctup.t_ybctid = 0;
 	scan->yb_exec_params = NULL;
 	scan->yb_scan_plan = NULL;
 	scan->yb_rel_pushdown = NULL;
 	scan->yb_idx_pushdown = NULL;
+	scan->yb_aggrefs = NIL;
+	scan->yb_agg_slot = NULL;
+	scan->yb_distinct_prefixlen = 0;
+	scan->fetch_ybctids_only = false;
 	return scan;
 }
 
@@ -435,10 +447,9 @@ systable_getnext(SysScanDesc sysscan)
 {
 	HeapTuple	htup;
 
-	if (IsYugaByteEnabled())
-	{
-		return ybc_systable_getnext(sysscan);
-	}
+	YbSysScanBase ybscan = sysscan->ybscan;
+	if (ybscan)
+		return ybscan->vtable->next(ybscan);
 
 	if (sysscan->irel)
 	{
@@ -521,10 +532,9 @@ systable_recheck_tuple(SysScanDesc sysscan, HeapTuple tup)
 void
 systable_endscan(SysScanDesc sysscan)
 {
-	if (IsYugaByteEnabled())
-	{
-		return ybc_systable_endscan(sysscan);
-	}
+	YbSysScanBase ybscan = sysscan->ybscan;
+	if (ybscan)
+		return ybscan->vtable->end(ybscan);
 
 	if (sysscan->irel)
 	{

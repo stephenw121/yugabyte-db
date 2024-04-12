@@ -3,7 +3,7 @@ title: Audit logging in YugabyteDB
 headerTitle: Audit logging
 linkTitle: Audit logging
 description: Audit logging in YugabyteDB.
-headcontent: Audit logging in YugabyteDB.
+headcontent: Trace statements and configure audit logging
 image: /images/section_icons/secure/authorization.png
 menu:
   stable:
@@ -13,7 +13,21 @@ menu:
 type: indexpage
 ---
 
+Use audit logging to produce audit logs needed to comply with government, financial, or ISO certifications.
+
 <div class="row">
+
+  <div class="col-12 col-md-6 col-lg-12 col-xl-6">
+    <a class="section-link icon-offset" href="trace-statements-ysql/">
+      <div class="head">
+        <img class="icon" src="/images/section_icons/secure/authentication.png" aria-hidden="true" />
+        <div class="title">Manually trace statements</div>
+      </div>
+      <div class="body">
+          Trace executed statements in a session using session identifiers.
+      </div>
+    </a>
+  </div>
 
   <div class="col-12 col-md-6 col-lg-12 col-xl-6">
     <a class="section-link icon-offset" href="audit-logging-ysql/">

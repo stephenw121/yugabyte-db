@@ -18,26 +18,24 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.io.PatternFilenameFilter;
+import com.typesafe.config.Config;
 import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.common.alerts.AlertRuleTemplateSubstitutor;
+import com.yugabyte.yw.common.alerts.impl.AlertTemplateService;
+import com.yugabyte.yw.common.alerts.impl.AlertTemplateService.AlertTemplateDescription;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.common.config.RuntimeConfigFactory;
-import com.yugabyte.yw.models.AlertConfiguration;
-import com.yugabyte.yw.models.AlertDefinition;
-import com.yugabyte.yw.models.AlertTemplateSettings;
-import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.common.config.UniverseConfKeys;
+import com.yugabyte.yw.models.*;
+import com.yugabyte.yw.models.helpers.KnownAlertLabels;
 import com.yugabyte.yw.models.helpers.MetricCollectionLevel;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Iterator;
-import java.util.List;
+import java.util.*;
 import java.util.Map.Entry;
-import java.util.UUID;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import javax.inject.Inject;
@@ -66,15 +64,24 @@ public class SwamperHelper {
 
   @VisibleForTesting static final String TARGET_FILE_NODE_PREFIX = "node.";
   @VisibleForTesting static final String TARGET_FILE_YUGABYTE_PREFIX = "yugabyte.";
+  @VisibleForTesting static final String TARGET_FILE_OTEL_PREFIX = "otel.";
   @VisibleForTesting static final String TARGET_FILE_PREFIX_PATTERN = "(node|yugabyte)\\.";
+  @VisibleForTesting static final String TARGET_FILE_NODE_AGENT_PREFIX = "node-agent.";
+  @VisibleForTesting static final String TARGET_FILE_NODE_AGENT_PREFIX_PATTERN = "node-agent\\.";
   private static final Pattern TARGET_FILE_PATTERN =
       Pattern.compile("^(node|yugabyte)\\." + UUID_PATTERN + ".json$");
+  private static final Pattern TARGET_FILE_NODE_AGENT_PATTERN =
+      Pattern.compile("^node-agent\\." + UUID_PATTERN + ".json$");
 
   private static final String TARGET_PATH_PARAM = "yb.swamper.targetPath";
   private static final String RULES_PATH_PARAM = "yb.swamper.rulesPath";
   public static final String COLLECTION_LEVEL_PARAM = "yb.metrics.collection_level";
+  public static final String SCRAPE_INTERVAL_PARAM = "yb.metrics.scrape_interval";
+  public static final String RANGE_PLACEHOLDER = "\\{\\{ range \\}\\}";
 
   private static final String PARAMETER_LABEL_PREFIX = "__param_";
+
+  private static final int IRATE_SCRAPE_PERIODS = 5;
 
   /*
      Sample targets file
@@ -96,11 +103,20 @@ public class SwamperHelper {
 
   private final RuntimeConfigFactory runtimeConfigFactory;
   private final Environment environment;
+  private final RuntimeConfGetter confGetter;
+
+  private final AlertTemplateService alertTemplateService;
 
   @Inject
-  public SwamperHelper(RuntimeConfigFactory runtimeConfigFactory, Environment environment) {
+  public SwamperHelper(
+      RuntimeConfigFactory runtimeConfigFactory,
+      Environment environment,
+      RuntimeConfGetter confGetter,
+      AlertTemplateService alertTemplateService) {
     this.runtimeConfigFactory = runtimeConfigFactory;
     this.environment = environment;
+    this.confGetter = confGetter;
+    this.alertTemplateService = alertTemplateService;
   }
 
   @Getter
@@ -111,7 +127,8 @@ public class SwamperHelper {
     TSERVER_EXPORT(true),
     REDIS_EXPORT(true),
     CQL_EXPORT(true),
-    YSQL_EXPORT(true);
+    YSQL_EXPORT(true),
+    OTEL_EXPORT(false);
 
     private final boolean collectionLevelSupported;
 
@@ -135,6 +152,8 @@ public class SwamperHelper {
           return nodeDetails.yqlServerHttpPort;
         case YSQL_EXPORT:
           return nodeDetails.ysqlServerHttpPort;
+        case OTEL_EXPORT:
+          return nodeDetails.otelCollectorMetricsPort;
         default:
           return 0;
       }
@@ -144,7 +163,13 @@ public class SwamperHelper {
   public enum LabelType {
     NODE_PREFIX,
     EXPORT_TYPE,
-    EXPORTED_INSTANCE
+    EXPORTED_INSTANCE,
+    NODE_NAME,
+    NODE_ADDRESS,
+    NODE_IDENTIFIER,
+    NODE_REGION,
+    NODE_CLUSTER_TYPE,
+    UNIVERSE_UUID
   }
 
   private ObjectNode getIndividualConfig(Universe universe, TargetType t, NodeDetails nodeDetails) {
@@ -157,10 +182,42 @@ public class SwamperHelper {
 
     ObjectNode labels = Json.newObject();
     labels.put(
+        LabelType.UNIVERSE_UUID.toString().toLowerCase(), universe.getUniverseUUID().toString());
+    labels.put(
         LabelType.NODE_PREFIX.toString().toLowerCase(), universe.getUniverseDetails().nodePrefix);
     labels.put(LabelType.EXPORT_TYPE.toString().toLowerCase(), t.toString().toLowerCase());
     if (nodeDetails.nodeName != null) {
+      // exported_instance is a special name that we should not use as a custom label.
+      // You get metrics with exported_ prefix if the collected data already have one of
+      // the predefined labels (such as 'job' and 'instance').
+      // As a result - our 'up' metrics does not have this exported_instance label (seem like some
+      // internal prometheus logic we can't change), while other metrics have one.
+      // So better just not use that. But have to leave for backward compatibility anyway.
       labels.put(LabelType.EXPORTED_INSTANCE.toString().toLowerCase(), nodeDetails.nodeName);
+      labels.put(LabelType.NODE_NAME.toString().toLowerCase(), nodeDetails.nodeName);
+    }
+    if (nodeDetails.cloudInfo != null) {
+      if (nodeDetails.cloudInfo.private_ip != null) {
+        labels.put(
+            LabelType.NODE_ADDRESS.toString().toLowerCase(), nodeDetails.cloudInfo.private_ip);
+      }
+      if (nodeDetails.cloudInfo.region != null) {
+        labels.put(LabelType.NODE_REGION.toString().toLowerCase(), nodeDetails.cloudInfo.region);
+      }
+      if (CloudType.onprem.name().equals(nodeDetails.cloudInfo.cloud)) {
+        NodeInstance nodeInstance = NodeInstance.get(nodeDetails.nodeUuid);
+        if (nodeInstance != null
+            && StringUtils.isNotEmpty(nodeInstance.getDetails().instanceName)) {
+          labels.put(
+              LabelType.NODE_IDENTIFIER.toString().toLowerCase(),
+              nodeInstance.getDetails().instanceName);
+        }
+      }
+    }
+    if (nodeDetails.placementUuid != null) {
+      labels.put(
+          LabelType.NODE_CLUSTER_TYPE.toString().toLowerCase(),
+          universe.getCluster(nodeDetails.placementUuid).clusterType.toString());
     }
     if (t.isCollectionLevelSupported()) {
       MetricCollectionLevel level = getLevel(universe);
@@ -176,11 +233,11 @@ public class SwamperHelper {
     return getOrCreateDirectory(TARGET_PATH_PARAM);
   }
 
-  private String getSwamperFile(UUID universeUUID, String prefix) {
+  private String getSwamperFile(UUID targetUUID, String prefix) {
     File swamperTargetDirectory = getSwamperTargetDirectory();
 
     if (swamperTargetDirectory != null) {
-      return String.format("%s/%s%s.json", swamperTargetDirectory, prefix, universeUUID.toString());
+      return String.format("%s/%s%s.json", swamperTargetDirectory, prefix, targetUUID.toString());
     }
     return null;
   }
@@ -217,6 +274,27 @@ public class SwamperHelper {
             });
     writeJsonFile(swamperFile, nodeTargets);
 
+    // Write out the otel specific file.
+    if (universe.getUniverseDetails().otelCollectorEnabled) {
+      ArrayNode otelTargets = Json.newArray();
+      swamperFile = getSwamperFile(universe.getUniverseUUID(), TARGET_FILE_OTEL_PREFIX);
+      universe
+          .getNodes()
+          .forEach(
+              (node) -> {
+                if (universe.getNodeDeploymentMode(node).equals(CloudType.kubernetes)) {
+                  // no otel collector on k8s pods yet
+                  return;
+                }
+                if (!node.isTserver || !node.isActive()) {
+                  // otel collector is only available on active TServers
+                  return;
+                }
+                otelTargets.add(getIndividualConfig(universe, TargetType.OTEL_EXPORT, node));
+              });
+      writeJsonFile(swamperFile, otelTargets);
+    }
+
     // Write out the yugabyte specific file.
     ArrayNode ybTargets = Json.newArray();
     swamperFile = getSwamperFile(universe.getUniverseUUID(), TARGET_FILE_YUGABYTE_PREFIX);
@@ -229,7 +307,9 @@ public class SwamperHelper {
               if (!node.isActive()) return;
 
               for (TargetType t : TargetType.values()) {
-                if (t == TargetType.NODE_EXPORT || t == TargetType.INVALID_EXPORT) {
+                if (t == TargetType.NODE_EXPORT
+                    || t == TargetType.OTEL_EXPORT
+                    || t == TargetType.INVALID_EXPORT) {
                   continue;
                 }
 
@@ -263,8 +343,26 @@ public class SwamperHelper {
     writeJsonFile(swamperFile, ybTargets);
   }
 
-  private void removeUniverseTargetJson(UUID universeUUID, String prefix) {
-    String swamperFile = getSwamperFile(universeUUID, prefix);
+  public void writeNodeAgentTargetJson(NodeAgent nodeAgent) {
+    String swamperFile = getSwamperFile(nodeAgent.getUuid(), TARGET_FILE_NODE_AGENT_PREFIX);
+    if (swamperFile == null || new File(swamperFile).exists()) {
+      return;
+    }
+    ArrayNode targets = Json.newArray();
+    ObjectNode target = Json.newObject();
+    ArrayNode targetNodes = Json.newArray();
+    ObjectNode labels = Json.newObject();
+    targetNodes.add(String.format("%s:%d", nodeAgent.getIp(), nodeAgent.getPort()));
+    labels.put(KnownAlertLabels.CUSTOMER_UUID.labelName(), nodeAgent.getCustomerUuid().toString());
+    labels.put(KnownAlertLabels.NODE_AGENT_UUID.labelName(), nodeAgent.getUuid().toString());
+    target.set("targets", targetNodes);
+    target.set("labels", labels);
+    targets.add(target);
+    writeJsonFile(swamperFile, targets);
+  }
+
+  private void removeTargetJson(UUID targetUUID, String prefix) {
+    String swamperFile = getSwamperFile(targetUUID, prefix);
     if (swamperFile != null) {
       File file = new File(swamperFile);
 
@@ -277,8 +375,13 @@ public class SwamperHelper {
 
   public void removeUniverseTargetJson(UUID universeUUID) {
     // TODO: make these constants / enums.
-    removeUniverseTargetJson(universeUUID, TARGET_FILE_NODE_PREFIX);
-    removeUniverseTargetJson(universeUUID, TARGET_FILE_YUGABYTE_PREFIX);
+    removeTargetJson(universeUUID, TARGET_FILE_NODE_PREFIX);
+    removeTargetJson(universeUUID, TARGET_FILE_OTEL_PREFIX);
+    removeTargetJson(universeUUID, TARGET_FILE_YUGABYTE_PREFIX);
+  }
+
+  public void removeNodeAgentTargetJson(UUID nodeAgentUUID) {
+    removeTargetJson(nodeAgentUUID, TARGET_FILE_NODE_AGENT_PREFIX);
   }
 
   private File getSwamperRuleDirectory() {
@@ -306,6 +409,10 @@ public class SwamperHelper {
     String fileContent;
     try (InputStream templateStream = environment.resourceAsStream("metric/recording_rules.yml")) {
       fileContent = IOUtils.toString(templateStream, StandardCharsets.UTF_8);
+      long scrapeInterval = getScrapeIntervalSeconds(runtimeConfigFactory.staticApplicationConf());
+      fileContent =
+          fileContent.replaceAll(
+              RANGE_PLACEHOLDER, String.format("%ds", (scrapeInterval * IRATE_SCRAPE_PERIODS)));
     } catch (IOException e) {
       throw new RuntimeException("Failed to read alert definition header template", e);
     }
@@ -321,6 +428,9 @@ public class SwamperHelper {
     if (swamperFile == null) {
       return;
     }
+
+    AlertTemplateDescription alertTemplateDescription =
+        alertTemplateService.getTemplateDescription(configuration.getTemplate());
 
     String fileContent;
     try (InputStream templateStream =
@@ -339,15 +449,17 @@ public class SwamperHelper {
     }
 
     fileContent +=
-        configuration
-            .getThresholds()
-            .keySet()
-            .stream()
+        configuration.getThresholds().keySet().stream()
             .map(
                 severity -> {
                   AlertRuleTemplateSubstitutor substitutor =
                       new AlertRuleTemplateSubstitutor(
-                          configuration, definition, severity, templateSettings);
+                          confGetter,
+                          alertTemplateDescription,
+                          configuration,
+                          definition,
+                          severity,
+                          templateSettings);
                   return substitutor.replace(template);
                 })
             .collect(Collectors.joining());
@@ -375,6 +487,13 @@ public class SwamperHelper {
   public List<UUID> getTargetUniverseUuids() {
     return extractUuids(
         getSwamperTargetDirectory(), TARGET_FILE_PATTERN, TARGET_FILE_PREFIX_PATTERN);
+  }
+
+  public List<UUID> getTargetNodeAgentUuids() {
+    return extractUuids(
+        getSwamperTargetDirectory(),
+        TARGET_FILE_NODE_AGENT_PATTERN,
+        TARGET_FILE_NODE_AGENT_PREFIX_PATTERN);
   }
 
   private List<UUID> extractUuids(File directory, Pattern pattern, String prefix) {
@@ -407,7 +526,7 @@ public class SwamperHelper {
 
   private MetricCollectionLevel getLevel(Universe universe) {
     return MetricCollectionLevel.fromString(
-        runtimeConfigFactory.forUniverse(universe).getString(COLLECTION_LEVEL_PARAM));
+        confGetter.getConfForScope(universe, UniverseConfKeys.metricsCollectionLevel));
   }
 
   private void appendCollectionLevelLabels(MetricCollectionLevel level, ObjectNode labels) {
@@ -439,5 +558,9 @@ public class SwamperHelper {
     } catch (Exception e) {
       throw new RuntimeException("Failed to read or process params file " + paramsFile, e);
     }
+  }
+
+  public static long getScrapeIntervalSeconds(Config config) {
+    return Util.goDurationToJava(config.getString(SCRAPE_INTERVAL_PARAM)).getSeconds();
   }
 }

@@ -137,7 +137,7 @@ TEST_F(DBBlockCacheTest, TestWithoutCompressedBlockCache) {
   auto options = GetOptions(table_options);
   InitTable(options);
 
-  FLAGS_cache_overflow_single_touch = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_cache_overflow_single_touch) = false;
   std::shared_ptr<Cache> cache = NewLRUCache(0, 0, false);
   table_options.block_cache = cache;
   options.table_factory.reset(new BlockBasedTableFactory(table_options));
@@ -151,8 +151,9 @@ TEST_F(DBBlockCacheTest, TestWithoutCompressedBlockCache) {
   for (size_t i = 0; i < kNumBlocks - 1; i++) {
     iter = db_->NewIterator(read_options);
     iter->Seek(ToString(i));
-    ASSERT_OK(iter->status());
-    CheckCacheCounters(options, 1, 0, 1, 0);
+    ASSERT_TRUE(ASSERT_RESULT(iter->CheckedValid()));
+    // 1 cache miss (loading the block) + 1 cache hit (table cache).
+    CheckCacheCounters(options, 1, 1, 1, 0);
     iterators[i].reset(iter);
   }
   size_t usage = cache->GetUsage();
@@ -170,11 +171,12 @@ TEST_F(DBBlockCacheTest, TestWithoutCompressedBlockCache) {
   for (size_t i = 0; i < kNumBlocks - 1; i++) {
     iter = db_->NewIterator(read_options);
     iter->Seek(ToString(i));
-    ASSERT_OK(iter->status());
-    CheckCacheCounters(options, 0, 1, 0, 0);
+    ASSERT_TRUE(ASSERT_RESULT(iter->CheckedValid()));
+    // 2 cache hits: the block + table cache.
+    CheckCacheCounters(options, 0, 2, 0, 0);
     iterators[i].reset(iter);
   }
-  FLAGS_cache_overflow_single_touch = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_cache_overflow_single_touch) = true;
 }
 
 #ifdef SNAPPY
@@ -185,7 +187,7 @@ TEST_F(DBBlockCacheTest, TestWithCompressedBlockCache) {
   options.compression = CompressionType::kSnappyCompression;
   InitTable(options);
 
-  FLAGS_cache_overflow_single_touch = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_cache_overflow_single_touch) = false;
   std::shared_ptr<Cache> cache = NewLRUCache(0, 0, false);
   std::shared_ptr<Cache> compressed_cache = NewLRUCache(0, 0, false);
   table_options.block_cache = cache;
@@ -201,8 +203,9 @@ TEST_F(DBBlockCacheTest, TestWithCompressedBlockCache) {
   for (size_t i = 0; i < kNumBlocks - 1; i++) {
     iter = db_->NewIterator(read_options);
     iter->Seek(ToString(i));
-    ASSERT_OK(iter->status());
-    CheckCacheCounters(options, 1, 0, 1, 0);
+    ASSERT_TRUE(ASSERT_RESULT(iter->CheckedValid()));
+    // 1 cache miss (loading the block) + 1 cache hit (table cache).
+    CheckCacheCounters(options, 1, 1, 1, 0);
     CheckCompressedCacheCounters(options, 1, 0, 1, 0);
     iterators[i].reset(iter);
   }
@@ -213,7 +216,7 @@ TEST_F(DBBlockCacheTest, TestWithCompressedBlockCache) {
   ASSERT_LT(0, compressed_usage);
   // Compressed block cache cannot be pinned.
   ASSERT_EQ(0, compressed_cache->GetPinnedUsage());
-  FLAGS_cache_overflow_single_touch = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_cache_overflow_single_touch) = true;
 }
 #endif
 

@@ -11,8 +11,7 @@
 // under the License.
 //
 
-#ifndef YB_MASTER_MASTER_FWD_H
-#define YB_MASTER_MASTER_FWD_H
+#pragma once
 
 #include <map>
 #include <memory>
@@ -27,6 +26,7 @@
 #include "yb/gutil/ref_counted.h"
 
 #include "yb/master/master_backup.fwd.h"
+#include "yb/master/master_replication.pb.h"
 #include "yb/master/tablet_split_fwd.h"
 
 #include "yb/util/enums.h"
@@ -50,8 +50,10 @@ class EncryptionManager;
 class CatalogManager;
 class CatalogManagerIf;
 class CatalogManagerBgTasks;
+class CloneStateManager;
 class CDCConsumerSplitDriverIf;
-class CDCRpcTasks;
+class XClusterRpcTasks;
+class CDCSplitDriverIf;
 class ClusterConfigInfo;
 class ClusterLoadBalancer;
 class FlushManager;
@@ -67,25 +69,34 @@ class MasterDdlProxy;
 class MasterEncryptionProxy;
 class MasterHeartbeatProxy;
 class MasterReplicationProxy;
+class MasterSnapshotCoordinator;
+class MasterTestProxy;
 class NamespaceInfo;
 class PermissionsManager;
 class RetryingTSRpcTask;
+class RetryingTSRpcTaskWithTable;
+class RetrySpecificTSRpcTask;
+class RetrySpecificTSRpcTaskWithTable;
 class SnapshotCoordinatorContext;
 class SnapshotState;
 class SysCatalogTable;
 class SysConfigInfo;
 class SysRowEntries;
+class TestAsyncRpcManager;
 class TSDescriptor;
 class TSManager;
 class UDTypeInfo;
-class XClusterSplitDriverIf;
+class XClusterManager;
+class XClusterManagerIf;
 class YQLPartitionsVTable;
 class YQLVirtualTable;
+class YsqlBackendsManager;
 class YsqlTablegroupManager;
 class YsqlTablespaceManager;
 class YsqlTransactionDdl;
 
-struct CDCConsumerStreamInfo;
+struct XClusterConsumerStreamInfo;
+struct PgTableReadData;
 struct TableDescription;
 struct TabletReplica;
 struct TabletReplicaDriveInfo;
@@ -93,9 +104,14 @@ struct TabletReplicaDriveInfo;
 class AsyncTabletSnapshotOp;
 using AsyncTabletSnapshotOpPtr = std::shared_ptr<AsyncTabletSnapshotOp>;
 
+class CloneStateInfo;
+using CloneStateInfoPtr = scoped_refptr<CloneStateInfo>;
+
+class NamespaceInfo;
+using NamespaceInfoPtr = scoped_refptr<NamespaceInfo>;
+
 class TableInfo;
 using TableInfoPtr = scoped_refptr<TableInfo>;
-using TableInfoMap = std::map<TableId, TableInfoPtr>;
 
 class TabletInfo;
 using TabletInfoPtr = scoped_refptr<TabletInfo>;
@@ -108,6 +124,7 @@ YB_STRONGLY_TYPED_BOOL(RegisteredThroughHeartbeat);
 
 YB_STRONGLY_TYPED_BOOL(IncludeInactive);
 YB_STRONGLY_TYPED_BOOL(IncludeDeleted);
+YB_STRONGLY_TYPED_BOOL(IsSystemObject);
 
 YB_DEFINE_ENUM(
     CollectFlag,
@@ -119,25 +136,22 @@ using TablespaceIdToReplicationInfoMap = std::unordered_map<
     TablespaceId, boost::optional<ReplicationInfoPB>>;
 
 using LeaderStepDownFailureTimes = std::unordered_map<TabletServerId, MonoTime>;
-using TabletReplicaMap = std::unordered_map<std::string, TabletReplica>;
+using TabletReplicaMap = std::unordered_map<TabletServerId, TabletReplica>;
 using TabletToTabletServerMap = std::unordered_map<TabletId, TabletServerId>;
 using TabletInfoMap = std::map<TabletId, scoped_refptr<TabletInfo>>;
 struct cloud_hash;
 struct cloud_equal_to;
 using AffinitizedZonesSet = std::unordered_set<CloudInfoPB, cloud_hash, cloud_equal_to>;
 using BlacklistSet = std::unordered_set<HostPort, HostPortHash>;
-using RetryingTSRpcTaskPtr = std::shared_ptr<RetryingTSRpcTask>;
+using RetryingTSRpcTaskWithTablePtr = std::shared_ptr<RetryingTSRpcTaskWithTable>;
 
 // Use ordered map to make computing fingerprint of the map easier.
-using DbOidToCatalogVersionMap = std::map<uint32_t, std::pair<uint64_t, uint64_t>>;
+struct PgCatalogVersion;
+using DbOidToCatalogVersionMap = std::map<uint32_t, PgCatalogVersion>;
 
-namespace enterprise {
-
+using RelIdToAttributesMap = std::unordered_map<uint32_t, std::vector<PgAttributePB>>;
+using RelTypeOIDMap = std::unordered_map<uint32_t, uint32_t>;
 class CatalogManager;
-
-} // namespace enterprise
 
 } // namespace master
 } // namespace yb
-
-#endif // YB_MASTER_MASTER_FWD_H

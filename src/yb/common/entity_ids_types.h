@@ -11,10 +11,10 @@
 // under the License.
 //
 
-#ifndef YB_COMMON_ENTITY_IDS_TYPES_H
-#define YB_COMMON_ENTITY_IDS_TYPES_H
+#pragma once
 
 #include <string>
+#include <unordered_set>
 
 #include "yb/util/strongly_typed_string.h"
 
@@ -30,7 +30,6 @@ using NamespaceId = std::string;
 using ObjectId = std::string;
 using TableId = std::string;
 using UDTypeId = std::string;
-using CDCStreamId = std::string;
 
 using PeerId = std::string;
 using SnapshotId = std::string;
@@ -40,6 +39,7 @@ using TablegroupId = std::string;
 using TablespaceId = std::string;
 
 YB_STRONGLY_TYPED_STRING(KvStoreId);
+YB_STRONGLY_TYPED_STRING(ReplicationSlotName);
 
 // TODO(#79): switch to YB_STRONGLY_TYPED_STRING
 using RaftGroupId = std::string;
@@ -50,6 +50,6 @@ using FlushRequestId = std::string;
 
 using RedisConfigKey = std::string;
 
-}  // namespace yb
+using TableIdSet = std::unordered_set<TableId>;
 
-#endif  // YB_COMMON_ENTITY_IDS_TYPES_H
+}  // namespace yb

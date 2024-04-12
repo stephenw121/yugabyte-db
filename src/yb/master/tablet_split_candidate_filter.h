@@ -11,8 +11,7 @@
 // under the License.
 //
 
-#ifndef YB_MASTER_TABLET_SPLIT_CANDIDATE_FILTER_H
-#define YB_MASTER_TABLET_SPLIT_CANDIDATE_FILTER_H
+#pragma once
 
 #include "yb/master/master_fwd.h"
 #include "yb/util/status_fwd.h"
@@ -25,16 +24,24 @@ class TabletSplitCandidateFilterIf {
   virtual ~TabletSplitCandidateFilterIf() {}
 
   // Table-level checks for whether we can split tablets in this table.
-  virtual bool IsCdcEnabled(const TableInfo& table_info) const = 0;
-  virtual bool IsTablePartOfBootstrappingCdcStream(const TableInfo& table_info) const = 0;
+  virtual Status XReplValidateSplitCandidateTable(const TableId& table_id) const = 0;
   virtual Result<bool> IsTablePartOfSomeSnapshotSchedule(const TableInfo& table_info) = 0;
 
   // Returns Status::OK if we should split a tablet based on the provided drive_info, and a status
   // explaining why not otherwise.
   virtual Status ShouldSplitValidCandidate(
       const TabletInfo& tablet_info, const TabletReplicaDriveInfo& drive_info) const = 0;
+
+  virtual Result<ReplicationInfoPB> GetTableReplicationInfo(const TableInfoPtr& table) = 0;
+
+  virtual Status CanAddPartitionsToTable(
+    size_t desired_partitions, const PlacementInfoPB& placement_info) = 0;
+
+  virtual Status CanSupportAdditionalTablet(
+      const TableInfoPtr& table, const ReplicationInfoPB& replication_info) const = 0;
+
+  virtual void IncrementSplitBlockedByTabletLimitCounter() = 0;
 };
 
 }  // namespace master
 }  // namespace yb
-#endif // YB_MASTER_TABLET_SPLIT_CANDIDATE_FILTER_H

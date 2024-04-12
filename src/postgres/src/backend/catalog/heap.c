@@ -380,12 +380,13 @@ heap_create(const char *relname,
 									 relkind);
 
 	/*
-	 * No need to create local storage for YB Tables as YugaByte will handle it.
-	 * Temporary tables in YugaByte mode use local storage.
+	 * Create local storage in YB only if storage is required and it is a
+	 * temporary relation.
 	 * TODO Consider hooking the YB-Create logic here instead of above.
 	 */
 	if (YBIsEnabledInPostgresEnvVar())
-		create_storage = relpersistence == RELPERSISTENCE_TEMP;
+		create_storage = create_storage &&
+						 relpersistence == RELPERSISTENCE_TEMP;
 
 	/*
 	 * Have the storage manager create the relation's disk file, if needed.
@@ -1515,7 +1516,7 @@ heap_create_with_catalog(const char *relname,
 
 		if (IsYsqlUpgrade && is_system && relkind != RELKIND_VIEW)
 		{
-			YBRecordPinDependency(&myself, shared_relation);
+			YbRecordPinDependency(&myself, shared_relation);
 		}
 		else
 		{
@@ -1565,6 +1566,10 @@ heap_create_with_catalog(const char *relname,
 	if (relpersistence == RELPERSISTENCE_UNLOGGED &&
 		relkind != RELKIND_PARTITIONED_TABLE)
 		heap_create_init_fork(new_rel_desc);
+
+	/* Increment sticky object count if the object is a TEMP TABLE. */
+	if (YbIsClientYsqlConnMgr() && new_rel_desc->rd_islocaltemp)
+		increment_sticky_object_count();
 
 	/*
 	 * ok, the relation has been cataloged, so close our relations and return
@@ -2087,11 +2092,15 @@ heap_drop_with_catalog(Oid relid)
 	if (relid == defaultPartOid)
 		update_default_partition_oid(parentOid, InvalidOid);
 
+	/* Decrement sticky object count if the relation being dropped is a TEMP TABLE. */
+	if (YbIsClientYsqlConnMgr() && (rel)->rd_islocaltemp)
+		decrement_sticky_object_count();
+	
 	/*
 	 * Schedule unlinking of the relation's physical files at commit.
-	 * If YugaByte is enabled, there aren't any physical files to remove.
+	 * For Yugabyte-backed relations, there aren't any physical files to remove.
 	 */
-	if (!IsYugaByteEnabled() &&
+	if (!IsYBRelation(rel) &&
 		rel->rd_rel->relkind != RELKIND_VIEW &&
 		rel->rd_rel->relkind != RELKIND_COMPOSITE_TYPE &&
 		rel->rd_rel->relkind != RELKIND_FOREIGN_TABLE &&
@@ -3799,4 +3808,10 @@ StorePartitionBound(Relation rel, Relation parent, PartitionBoundSpec *bound)
 		CacheInvalidateRelcacheByRelid(defaultPartOid);
 
 	CacheInvalidateRelcache(parent);
+}
+
+Node *
+YbCookConstraint(ParseState *pstate, Node *raw_constraint, char *relname)
+{
+	return cookConstraint(pstate, raw_constraint, relname);
 }

@@ -258,28 +258,30 @@ static void ri_ReportViolation(const RI_ConstraintInfo *riinfo,
 static YBCPgYBTupleIdDescriptor*
 YBCBuildYBTupleIdDescriptor(const RI_ConstraintInfo *riinfo, HeapTuple tup)
 {
-	Oid source_table_oid = riinfo->pk_relid;
 	bool using_index = false;
 	Relation idx_rel = RelationIdGetRelation(riinfo->conindid);
 	Relation source_rel = idx_rel;
 	if (idx_rel->rd_index != NULL && !idx_rel->rd_index->indisprimary)
 	{
 		Assert(IndexRelationGetNumberOfKeyAttributes(idx_rel) == riinfo->nkeys);
-		source_table_oid = riinfo->conindid;
 		using_index = true;
 	} else
 	{
 		RelationClose(idx_rel);
 		source_rel = RelationIdGetRelation(riinfo->pk_relid);
 	}
+	Oid source_rel_relfilenode_oid = YbGetRelfileNodeId(source_rel);
 	Oid source_dboid = YBCGetDatabaseOid(source_rel);
 	YBCPgYBTupleIdDescriptor* result = YBCCreateYBTupleIdDescriptor(
-		source_dboid, source_table_oid, riinfo->nkeys + (using_index ? 1 : 0));
+		source_dboid, source_rel_relfilenode_oid,
+		riinfo->nkeys + (using_index ? 1 : 0));
 	YBCPgAttrValueDescriptor *next_attr = result->attrs;
 
 	Relation fk_rel = RelationIdGetRelation(riinfo->fk_relid);
 	YBCPgTableDesc ybc_source_table_desc = NULL;
-	HandleYBStatus(YBCPgGetTableDesc(source_dboid, source_table_oid, &ybc_source_table_desc));
+	HandleYBStatus(YBCPgGetTableDesc(source_dboid,
+									 source_rel_relfilenode_oid,
+									 &ybc_source_table_desc));
 
 	TupleDesc fk_tupdesc = fk_rel->rd_att;
 	TupleDesc source_tupdesc = source_rel->rd_att;
@@ -2706,11 +2708,20 @@ ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 						   save_sec_context | SECURITY_LOCAL_USERID_CHANGE |
 						   SECURITY_NOFORCE_RLS);
 
-	/* Finally we can run the query. */
-	spi_result = SPI_execute_snapshot(qplan,
-									  vals, nulls,
-									  test_snapshot, crosscheck_snapshot,
-									  false, false, limit);
+	PG_TRY();
+	{
+		/* Finally we can run the query. */
+		spi_result = SPI_execute_snapshot(qplan, vals, nulls, test_snapshot,
+										  crosscheck_snapshot, false, false,
+										  limit);
+	}
+	PG_CATCH();
+	{
+		/* Restore UID and security context in case of execution failure */
+		SetUserIdAndSecContext(save_userid, save_sec_context);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	/* Restore UID and security context */
 	SetUserIdAndSecContext(save_userid, save_sec_context);

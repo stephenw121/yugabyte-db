@@ -29,28 +29,33 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_CONSENSUS_CONSENSUS_META_H_
-#define YB_CONSENSUS_CONSENSUS_META_H_
+#pragma once
 
 #include <stdint.h>
 
 #include <atomic>
+#include <optional>
 #include <string>
 
 #include "yb/common/common_types.pb.h"
 #include "yb/common/entity_ids_types.h"
+#include "yb/common/opid.h"
 
 #include "yb/consensus/metadata.pb.h"
 
 #include "yb/gutil/macros.h"
 
-#include "yb/util/opid.h"
 #include "yb/util/status_fwd.h"
 
 namespace yb {
 
 class FsManager;
 class ServerRegistrationPB;
+
+struct CloneSourceInfo {
+  uint32_t seq_no;
+  TabletId tablet_id;
+};
 
 namespace consensus {
 
@@ -81,12 +86,11 @@ class ConsensusMetadata {
  public:
   // Create a ConsensusMetadata object with provided initial state.
   // Encoded PB is flushed to disk before returning.
-  static Status Create(FsManager* fs_manager,
+  static Result<std::unique_ptr<ConsensusMetadata>> Create(FsManager* fs_manager,
                                const std::string& tablet_id,
                                const std::string& peer_uuid,
                                const RaftConfigPB& config,
-                               int64_t current_term,
-                               std::unique_ptr<ConsensusMetadata>* cmeta);
+                               int64_t current_term);
 
   // Load a ConsensusMetadata object from disk.
   // Returns Status::NotFound if the file could not be found. May return other
@@ -118,6 +122,10 @@ class ConsensusMetadata {
   bool has_split_parent_tablet_id() const;
   const TabletId& split_parent_tablet_id() const;
   void set_split_parent_tablet_id(const TabletId& split_parent_tablet_id);
+
+  // CloneSourceInfo contains info about the clone request that created this tablet.
+  const std::optional<CloneSourceInfo> clone_source_info() const;
+  void set_clone_source_info(uint32_t seq_no, const TabletId& tablet_id);
 
   // Returns whether a pending configuration is set.
   bool has_pending_config() const;
@@ -185,6 +193,10 @@ class ConsensusMetadata {
   // Used internally for storing the role + term combination atomically.
   using PackedRoleAndTerm = uint64;
 
+  const ConsensusMetadataPB& GetConsensusMetadataPB() const {
+    return pb_;
+  }
+
  private:
   ConsensusMetadata(FsManager* fs_manager, std::string tablet_id,
                     std::string peer_uuid);
@@ -234,5 +246,3 @@ void CopyRegistration(ServerRegistrationPB source, RaftPeerPB* dest);
 
 } // namespace consensus
 } // namespace yb
-
-#endif // YB_CONSENSUS_CONSENSUS_META_H_

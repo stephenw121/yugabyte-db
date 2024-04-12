@@ -107,6 +107,13 @@ typedef IndexBuildResult *(*yb_ambackfill_function) (Relation heapRelation,
 													 struct YbBackfillInfo *bfinfo,
 													 struct YbPgExecOutParam *bfresult);
 
+/* return whether this Yugabyte-based index might recheck indexquals */
+typedef bool (*yb_ammightrecheck_function) (Relation heap,
+											Relation index,
+											bool xs_want_itup,
+											ScanKey keys,
+											int nkeys);
+
 /* bulk delete */
 typedef IndexBulkDeleteResult *(*ambulkdelete_function) (IndexVacuumInfo *info,
 														 IndexBulkDeleteResult *stats,
@@ -161,6 +168,10 @@ typedef bool (*amgettuple_function) (IndexScanDesc scan,
 /* fetch all valid tuples */
 typedef int64 (*amgetbitmap_function) (IndexScanDesc scan,
 									   TIDBitmap *tbm);
+
+/* YB: fetch all valid tuples */
+typedef int64 (*yb_amgetbitmap_function) (IndexScanDesc scan,
+										  YbTIDBitmap *ybtbm);
 
 /* end index scan */
 typedef void (*amendscan_function) (IndexScanDesc scan);
@@ -262,6 +273,8 @@ typedef struct IndexAmRoutine
 	yb_aminsert_function yb_aminsert;
 	yb_amdelete_function yb_amdelete;
 	yb_ambackfill_function yb_ambackfill;
+	yb_ammightrecheck_function yb_ammightrecheck;
+	yb_amgetbitmap_function yb_amgetbitmap;
 
 } IndexAmRoutine;
 

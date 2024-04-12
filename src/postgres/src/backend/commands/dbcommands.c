@@ -81,7 +81,9 @@
 
 /*  YB includes. */
 #include "commands/ybccmds.h"
+#include "common/pg_yb_common.h"
 #include "pg_yb_utils.h"
+#include "yb_ysql_conn_mgr_helper.h"
 
 typedef struct
 {
@@ -265,8 +267,10 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 					 errhint("Consider using tablespaces instead."),
 					 parser_errposition(pstate, defel->location)));
 		}
-		else if (strcmp(defel->defname, "colocated") == 0)
+		else if (strcmp(defel->defname, "colocated") == 0
+				 || strcmp(defel->defname, "colocation") == 0)
 		{
+			/* Ensure only one of colocation and colocated can be specified. */
 			if (dcolocated)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
@@ -331,6 +335,8 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	}
 	if (dcolocated && dcolocated->arg)
 		dbcolocated = defGetBoolean(dcolocated);
+	else
+		dbcolocated = YBColocateDatabaseByDefault();
 
 	/* obtain OID of proposed owner */
 	if (dbowner)
@@ -607,10 +613,28 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	 */
 	pg_database_rel = heap_open(DatabaseRelationId, RowExclusiveLock);
 
-	do
+	/*
+	 * In vanilla PG, OIDs are assigned by a cluster-wide counter.
+	 * For YSQL, we allocate OIDs on a per-database level and share the
+	 * per-database OID range on tserver for all databases. OID collision
+	 * happens due to the same range of OIDs allocated to different tservers.
+	 * OID collision can happen for CREATE DATABASE. If it happens, we want to
+	 * keep retrying CREATE DATABASE using the next available OID.
+	 * This is needed for xcluster.
+	 */
+	bool retry_on_oid_collision = false;
+	do 
 	{
-		dboid = GetNewOid(pg_database_rel);
-	} while (check_db_file_conflict(dboid));
+		do
+		{
+			dboid = GetNewOid(pg_database_rel);
+		} while (check_db_file_conflict(dboid));
+
+		retry_on_oid_collision = false;
+		if (IsYugaByteEnabled())
+			YBCCreateDatabase(dboid, dbname, src_dboid, InvalidOid, dbcolocated,
+							  &retry_on_oid_collision);
+	} while (retry_on_oid_collision);
 
 	/*
 	 * Insert a new tuple into pg_database.  This establishes our ownership of
@@ -637,9 +661,6 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	new_record[Anum_pg_database_datfrozenxid - 1] = TransactionIdGetDatum(src_frozenxid);
 	new_record[Anum_pg_database_datminmxid - 1] = TransactionIdGetDatum(src_minmxid);
 	new_record[Anum_pg_database_dattablespace - 1] = ObjectIdGetDatum(dst_deftablespace);
-
-	if (IsYugaByteEnabled())
-		YBCCreateDatabase(dboid, dbname, src_dboid, InvalidOid, dbcolocated);
 
 	/*
 	 * We deliberately set datacl to default (NULL), rather than copying it
@@ -1015,13 +1036,37 @@ removing_database_from_system:
 	 * database lock, no new ones can start after this.)
 	 *
 	 * As in CREATE DATABASE, check this after other error conditions.
+	 *
+	 * number of actual client connections =
+	 *		number of clients connected on ysql port
+	 * 			+ number of clients connected on ysql connection manager port
+	 * 			- number of server connections b/w ysql connection manager and ysql.
 	 */
-	if (CountOtherDBBackends(db_id, &notherbackends, &npreparedxacts))
+	uint32_t 	yb_num_logical_conn,
+				yb_num_physical_conn_from_ysqlconnmgr,
+				yb_net_client_connections;
+
+	CountOtherDBBackends(db_id, &notherbackends, &npreparedxacts);
+
+	yb_net_client_connections = notherbackends;
+
+	/*
+	 * Ignore the number of logical or physical connections to the database
+	 * if pg_backend is unable to read the shared memory segment for
+	 * Ysql Connection Manager stats.
+	 */
+	if (IsYugaByteEnabled() &&
+		YbGetNumYsqlConnMgrConnections(dbname, NULL, &yb_num_logical_conn,
+									   &yb_num_physical_conn_from_ysqlconnmgr))
+		yb_net_client_connections +=
+			yb_num_logical_conn - yb_num_physical_conn_from_ysqlconnmgr;
+
+	if (yb_net_client_connections != 0 || npreparedxacts != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("database \"%s\" is being accessed by other users",
-						dbname),
-				 errdetail_busy_db(notherbackends, npreparedxacts)));
+				 errmsg("database \"%s\" is being accessed by other users, num logical conn %d physical %d",
+						dbname, yb_num_logical_conn, yb_num_physical_conn_from_ysqlconnmgr),
+				 errdetail_busy_db(yb_net_client_connections, npreparedxacts)));
 
 	/*
 	 * Remove the database's tuple from pg_database.

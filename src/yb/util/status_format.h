@@ -13,8 +13,7 @@
 //
 //
 
-#ifndef YB_UTIL_STATUS_FORMAT_H
-#define YB_UTIL_STATUS_FORMAT_H
+#pragma once
 
 #include "yb/gutil/strings/substitute.h"
 
@@ -44,10 +43,16 @@
     if (PREDICT_FALSE(!(expr))) return STATUS_FORMAT(status_type, (msg), __VA_ARGS__); \
   } while (0)
 
+#define SCHECK_EC_FORMAT(expr, status_type, error_code, msg, ...) \
+  do { \
+    if (PREDICT_FALSE(!(expr))) \
+      return STATUS_EC_FORMAT(status_type, error_code, (msg), __VA_ARGS__); \
+  } while (0)
+
 #define SCHECK_OP(var1, op, var2, status_type, msg) \
   do { \
-    auto v1_tmp = (var1); \
-    auto v2_tmp = (var2); \
+    const auto& v1_tmp = (var1); \
+    const auto& v2_tmp = (var2); \
     if (PREDICT_FALSE(!(v1_tmp op v2_tmp))) { \
       return STATUS_FORMAT(status_type, "$0: $1 vs $2", (msg), v1_tmp, v2_tmp); \
     } \
@@ -55,8 +60,8 @@
 
 #define SCHECK_OP_FUNC(var1, op_func, var2, status_type, msg) \
   do { \
-    auto v1_tmp = (var1); \
-    auto v2_tmp = (var2); \
+    const auto& v1_tmp = (var1); \
+    const auto& v2_tmp = (var2); \
     if (PREDICT_FALSE(!(op_func(v1_tmp, v2_tmp)))) { \
       return STATUS_FORMAT(status_type, "$0: $1 vs $2", (msg), v1_tmp, v2_tmp); \
     } \
@@ -116,4 +121,7 @@
     } \
   } while (0)
 
-#endif // YB_UTIL_STATUS_FORMAT_H
+#define RSTATUS_DCHECK_NOTNULL(expr) \
+    RSTATUS_DCHECK((expr) != nullptr, \
+                   RuntimeError, \
+                   "$0 is null in $1", BOOST_PP_STRINGIZE(expr), __PRETTY_FUNCTION__)

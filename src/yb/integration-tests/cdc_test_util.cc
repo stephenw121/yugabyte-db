@@ -15,6 +15,7 @@
 
 #include <gtest/gtest.h>
 
+#include "yb/cdc/cdc_service.pb.h"
 #include "yb/consensus/log.h"
 
 #include "yb/rpc/rpc_controller.h"
@@ -22,7 +23,7 @@
 #include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/tablet_peer.h"
 
-#include "yb/tserver/cdc_consumer.h"
+#include "yb/tserver/xcluster_consumer_if.h"
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
 #include "yb/tserver/ts_tablet_manager.h"
@@ -31,34 +32,72 @@
 #include "yb/util/result.h"
 #include "yb/util/test_macros.h"
 
+#include "yb/cdc/cdc_service.h"
+#include "yb/dockv/doc_key.h"
+
 namespace yb {
 namespace cdc {
 
 using yb::MiniCluster;
 
-void AssertIntKey(const google::protobuf::RepeatedPtrField<cdc::KeyValuePairPB>& key,
-                  int32_t value) {
-  ASSERT_EQ(key.size(), 1);
-  ASSERT_EQ(key[0].key(), "key");
-  ASSERT_EQ(key[0].value().int32_value(), value);
+Result<QLValuePB> ExtractKey(
+    const Schema& schema, const cdc::KeyValuePairPB& key, std::string expected_col_name,
+    size_t col_id, bool range_col) {
+  Slice key_slice(key.value().binary_value());
+  dockv::SubDocKey decoded_key;
+  RETURN_NOT_OK(decoded_key.DecodeFrom(&key_slice, dockv::HybridTimeRequired::kFalse));
+
+  size_t column_schema_id = col_id;
+  if (range_col) {
+    column_schema_id += decoded_key.doc_key().hashed_group().size();
+  }
+
+  const ColumnSchema& col = schema.column(column_schema_id);
+  SCHECK_EQ(col.name(), expected_col_name, IllegalState, "Unexpected column name");
+
+  QLValuePB value;
+  if (range_col) {
+    SCHECK_GT(
+        decoded_key.doc_key().range_group().size(), col_id, IllegalState, "Unexpected range group");
+
+    decoded_key.doc_key().range_group()[col_id].ToQLValuePB(col.type(), &value);
+  } else {
+    SCHECK_GT(
+        decoded_key.doc_key().hashed_group().size(), col_id, IllegalState,
+        "Unexpected hashed group");
+
+    decoded_key.doc_key().hashed_group()[col_id].ToQLValuePB(col.type(), &value);
+  }
+
+  return value;
 }
 
-void CreateCDCStream(const std::unique_ptr<CDCServiceProxy>& cdc_proxy,
-                     const TableId& table_id,
-                     CDCStreamId* stream_id,
-                     cdc::CDCRequestSource source_type) {
+void AssertIntKey(
+    const Schema& schema, const google::protobuf::RepeatedPtrField<cdc::KeyValuePairPB>& key,
+    int32_t value) {
+  ASSERT_EQ(key.size(), 1);
+  auto int_val = ASSERT_RESULT(ExtractKey(schema, key[0], "key"));
+  ASSERT_EQ(int_val.int32_value(), value);
+}
+
+Result<xrepl::StreamId> CreateCDCStream(
+    const std::unique_ptr<CDCServiceProxy>& cdc_proxy,
+    const TableId& table_id,
+    cdc::CDCRequestSource source_type) {
   CreateCDCStreamRequestPB req;
   CreateCDCStreamResponsePB resp;
   req.set_table_id(table_id);
   req.set_source_type(source_type);
+  req.set_checkpoint_type(IMPLICIT);
+  req.set_record_format(CDCRecordFormat::WAL);
 
   rpc::RpcController rpc;
-  ASSERT_OK(cdc_proxy->CreateCDCStream(req, &resp, &rpc));
-  ASSERT_FALSE(resp.has_error());
-
-  if (stream_id) {
-    *stream_id = resp.stream_id();
+  RETURN_NOT_OK(cdc_proxy->CreateCDCStream(req, &resp, &rpc));
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
   }
+
+  return xrepl::StreamId::FromString(resp.stream_id());
 }
 
 void WaitUntilWalRetentionSecs(std::function<int()> get_wal_retention_secs,
@@ -103,10 +142,11 @@ size_t NumProducerTabletsPolled(MiniCluster* cluster) {
   size_t size = 0;
   for (const auto& mini_tserver : cluster->mini_tablet_servers()) {
     size_t new_size = 0;
-    auto* tserver = dynamic_cast<tserver::enterprise::TabletServer*>(mini_tserver->server());
-    tserver::enterprise::CDCConsumer* cdc_consumer;
-    if (tserver && (cdc_consumer = tserver->GetCDCConsumer()) && mini_tserver->is_started()) {
-      auto tablets_running = cdc_consumer->TEST_producer_tablets_running();
+    auto* tserver = mini_tserver->server();
+    tserver::XClusterConsumerIf* xcluster_consumer;
+    if (tserver && (xcluster_consumer = tserver->GetXClusterConsumer()) &&
+        mini_tserver->is_started()) {
+      auto tablets_running = xcluster_consumer->TEST_producer_tablets_running();
       new_size = tablets_running.size();
     }
     size += new_size;
@@ -135,5 +175,20 @@ Status CorrectlyPollingAllTablets(
       timeout, "Num producer tablets being polled");
 }
 
+Result<std::shared_ptr<xrepl::XClusterTabletMetrics>> GetXClusterTabletMetrics(
+    cdc::CDCServiceImpl& cdc_service, const TabletId& tablet_id, const xrepl::StreamId stream_id,
+    cdc::CreateMetricsEntityIfNotFound create) {
+  auto tablet_peer = VERIFY_RESULT(cdc_service.GetServingTablet(tablet_id));
+  SCHECK(tablet_peer, IllegalState, "Tablet not found", tablet_id);
+  return cdc_service.GetXClusterTabletMetrics(*tablet_peer.get(), stream_id, create);
+}
+
+Result<std::shared_ptr<xrepl::CDCSDKTabletMetrics>> GetCDCSDKTabletMetrics(
+    cdc::CDCServiceImpl& cdc_service, const TabletId& tablet_id, const xrepl::StreamId stream_id,
+    cdc::CreateMetricsEntityIfNotFound create) {
+  auto tablet_peer = VERIFY_RESULT(cdc_service.GetServingTablet(tablet_id));
+  SCHECK(tablet_peer, IllegalState, "Tablet not found", tablet_id);
+  return cdc_service.GetCDCSDKTabletMetrics(*tablet_peer.get(), stream_id, create);
+}
 } // namespace cdc
 } // namespace yb

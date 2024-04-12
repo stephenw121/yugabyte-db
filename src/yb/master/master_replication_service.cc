@@ -15,6 +15,7 @@
 #include "yb/master/master_replication.service.h"
 #include "yb/master/master_service_base.h"
 #include "yb/master/master_service_base-internal.h"
+#include "yb/master/xcluster/xcluster_manager.h"
 
 namespace yb {
 namespace master {
@@ -29,10 +30,6 @@ class MasterReplicationServiceImpl : public MasterServiceBase, public MasterRepl
   MASTER_SERVICE_IMPL_ON_LEADER_WITH_LOCK(
     CatalogManager,
     (ValidateReplicationInfo)
-  )
-
-  MASTER_SERVICE_IMPL_ON_LEADER_WITH_LOCK(
-    enterprise::CatalogManager,
     (AlterUniverseReplication)
     (CreateCDCStream)
     (DeleteCDCStream)
@@ -41,16 +38,40 @@ class MasterReplicationServiceImpl : public MasterServiceBase, public MasterRepl
     (GetUniverseReplication)
     (GetUDTypeMetadata)
     (IsSetupUniverseReplicationDone)
+    (IsSetupNamespaceReplicationWithBootstrapDone)
     (UpdateConsumerOnProducerSplit)
     (UpdateConsumerOnProducerMetadata)
+    (XClusterReportNewAutoFlagConfigVersion)
     (ListCDCStreams)
+    (IsObjectPartOfXRepl)
     (SetUniverseReplicationEnabled)
+    (SetupNamespaceReplicationWithBootstrap)
     (SetupUniverseReplication)
     (UpdateCDCStream)
     (GetCDCDBStreamInfo)
     (IsBootstrapRequired)
     (WaitForReplicationDrain)
     (SetupNSUniverseReplication)
+    (GetReplicationStatus)
+    (GetTableSchemaFromSysCatalog)
+    (ChangeXClusterRole)
+    (BootstrapProducer)
+    (YsqlBackfillReplicationSlotNameToCDCSDKStream)
+  )
+
+  MASTER_SERVICE_IMPL_ON_LEADER_WITH_LOCK(
+      XClusterManager,
+      (GetXClusterSafeTime)
+      (GetXClusterSafeTimeForNamespace)
+      (PauseResumeXClusterProducerStreams)
+      (XClusterCreateOutboundReplicationGroup)
+      (XClusterAddNamespaceToOutboundReplicationGroup)
+      (XClusterRemoveNamespaceFromOutboundReplicationGroup)
+      (XClusterDeleteOutboundReplicationGroup)
+      (IsXClusterBootstrapRequired)
+      (GetXClusterStreams)
+      (CreateXClusterReplication)
+      (IsCreateXClusterReplicationDone)
   )
 };
 

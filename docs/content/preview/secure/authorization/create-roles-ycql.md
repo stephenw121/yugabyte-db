@@ -1,10 +1,9 @@
 ---
-title: Manage users and roles
+title: Manage users and roles - YCQL
 headerTitle: Manage users and roles
 linkTitle: Manage users and roles
 description: Manage users and roles in YCQL
 headcontent: Manage users and roles
-image: /images/section_icons/secure/create-roles.png
 menu:
   preview:
     identifier: create-roles-ycql
@@ -113,8 +112,8 @@ You should see the following output:
 In the table above, note the following:
 
 * The `cassandra` role is the built-in superuser.
-* The role `john` can login, and hence is a user. Note that `john` is not a superuser.
-* The roles `engineering` and `developer` cannot login.
+* The role `john` can log in, and hence is a user. Note that `john` is not a superuser.
+* The roles `engineering` and `developer` cannot log in.
 * Both `john` and `developer` inherit the role `engineering`.
 
 ## Revoke roles

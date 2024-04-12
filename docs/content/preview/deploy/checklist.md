@@ -2,9 +2,7 @@
 title: Deployment checklist for YugabyteDB clusters
 headerTitle: Deployment checklist
 linkTitle: Deployment checklist
-description: Deployment checklist for multi-node YugabyteDB clusters used for production and performance testing
-aliases:
-  - /deploy/checklist/
+description: Checklist to review system requirements, configuration details, and so on, when deploying the YugabyteDB database to production or for performance testing.  
 menu:
   preview:
     identifier: checklist
@@ -17,7 +15,8 @@ A YugabyteDB cluster consists of two distributed services - the [YB-TServer](../
 
 ## Basics
 
-- YugabyteDB works on a variety of operating systems. For production workloads, the recommended operating systems are CentOS 7.*n* and RHEL 7.*n*.
+- YugabyteDB supports both x86 and ARM (aarch64) CPU architectures.
+- YugabyteDB is supported on a variety of [operating systems](../../reference/configuration/operating-systems/). For production workloads, the recommended operating systems are AlmaLinux 8 and RHEL 8.
 - The appropriate system limits should be set using [`ulimit`](../manual-deployment/system-config/#ulimits) on each node running a YugabyteDB server.
 - [NTP or chrony](../manual-deployment/system-config/#ntp) should be used to synchronize time among the machines.
 
@@ -141,7 +140,7 @@ For YugabyteDB to preserve data consistency, the clock drift and clock skew acro
 
 Set a safe value for the maximum clock skew flag (`--max_clock_skew_usec`) for YB-TServers and YB-Masters when starting the YugabyteDB servers. The recommended value is two times the expected maximum clock skew between any two nodes in your deployment.
 
-For example, if the maximum clock skew across nodes is expected to be no more than 250 microseconds, then set the parameter to 500 microseconds (`--max_clock_skew_usec=500000`).
+For example, if the maximum clock skew across nodes is expected to be no more than 250 milliseconds, then set the parameter to 500000 (`--max_clock_skew_usec=500000`).
 
 ### Clock drift
 
@@ -160,9 +159,9 @@ YugabyteDB can run on a number of public clouds.
 ### Amazon Web Services (AWS)
 
 - Use the C5 or I3 instance families.
-- Recommended types are i3.4xlarge, i3.8xlarge, c5.4xlarge, and c5.8xlarge. Use the higher CPU instance types especially for large YSQL workloads.
+- Recommended types are i3.4xlarge, i3.8xlarge, c5.4xlarge, c5.8xlarge, and c6g.4xlarge/8xlarge. Use the higher CPU instance types especially for large YSQL workloads.
 - For the C5 instance family, use gp3 EBS (SSD) disks that are at least 250GB in size, larger if more IOPS are needed:
-  - The number of IOPS are proportional to the size of the disk.
+  - Scale up the IOPS as you scale up the size of the disk.
   - In YugabyteDB testing, gp3 EBS SSDs provide the best performance for a given cost among the various EBS disk options.
 - Avoid running on [T2 instance types](https://aws.amazon.com/ec2/instance-types/t2/). The T2 instance types are burstable instance types. Their baseline performance and ability to burst are governed by CPU credits, which makes it hard to get steady performance.
 - Use VPC peering for multi-region deployments and connectivity to S3 object stores.
@@ -171,15 +170,15 @@ YugabyteDB can run on a number of public clouds.
 
 - Use the N2 high-CPU instance family. As a second choice, the N2 standard instance family can be used.
 - Recommended instance types are `n2-highcpu-16` and `n2-highcpu-32`.
-- [Local SSDs](https://cloud.google.com/compute/docs/disks/#localssds) are the preferred storage option, as they provide improved performance over attached disks, but the data is not replicated and can be lost if the node fails. This option is ideal for databases such as YugabyteDB that manage their own replication and can guarantee high availability (HA). For more details on these tradeoffs, refer to [Local vs remote SSDs](../../deploy/kubernetes/best-practices/#local-vs-remote-ssds).
+- [Local SSDs](https://cloud.google.com/compute/docs/disks/#localssds) are the preferred storage option, as they provide improved performance over attached disks, but the data is not replicated and can be lost if the node fails. This option is ideal for databases such as YugabyteDB that manage their own replication and can guarantee high availability (HA). For more details on these tradeoffs, refer to [Local vs remote SSDs](../../deploy/kubernetes/best-practices/#local-versus-remote-ssds).
   - Each local SSD is 375 GB in size, but you can attach up to eight local SSD devices for 3 TB of total local SSD storage space per instance.
 - As a second choice, [remote persistent SSDs](https://cloud.google.com/compute/docs/disks/#pdspecs) perform well. Make sure the size of these SSDs are at least 250GB in size, larger if more IOPS are needed:
-  - The number of IOPS are proportional to the size of the disk.
+  - The number of IOPS scale automatically in proportion to the size of the disk.
 - Avoid running on f1 or g1 machine families. These are [burstable, shared core machines](https://cloud.google.com/compute/docs/machine-types#sharedcore) that may not deliver steady performance.
 
 ### Azure
 
 - Use v5 options with 16 vCPU in the Storage Optimized (preferred) or General Purpose VM types. For a busy YSQL instance, use 32 vCPU.
-- For an application that cannot tolerate P99 spikes, local SSDs (Storage Optimized instances) are the preferred option. For more details on the tradeoffs, refer to [Local vs remote SSDs](../../deploy/kubernetes/best-practices/#local-vs-remote-ssds).
+- For an application that cannot tolerate P99 spikes, local SSDs (Storage Optimized instances) are the preferred option. For more details on the tradeoffs, refer to [Local vs remote SSDs](../../deploy/kubernetes/best-practices/#local-versus-remote-ssds).
 - If local SSDs are not available, use ultra disks to eliminate expected latency on Azure premium disks. Refer to the Azure [disk recommendations](https://azure.microsoft.com/en-us/blog/azure-ultra-disk-storage-microsoft-s-service-for-your-most-i-o-demanding-workloads/) and Azure documentation on [disk types](https://docs.microsoft.com/en-us/azure/virtual-machines/disks-types) for databases.
 - Turn on Accelerated Networking, and use VNet peering for multiple VPCs and connectivity to object stores.
